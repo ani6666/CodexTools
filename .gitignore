@@ -1,0 +1,30 @@
+# 本地环境与秘密
+.env
+.env.*
+!.env.example
+*.local
+
+# Codex 本地日志与临时文件
+.codex-log/
+.local/
+.tmp/
+tmp/
+
+# 本地 Codex 协作与开发资料
+# 这些内容服务于本机开发流程，不属于开源项目交付物。
+.codex/
+.agents/
+AGENTS.md
+AGENTS.override.md
+
+# 内部设计、规划与仓库维护资料
+docs/
+CONTRIBUTING.md
+scripts/
+.github/
+
+# 常见编辑器与操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
