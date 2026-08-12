@@ -1,0 +1,18 @@
+[package]
+name = "local-infrastructure"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "CodexTools SQLite 与本地基础设施实现"
+
+[dependencies]
+codex-application = { path = "../codex-application" }
+codex-domain = { path = "../codex-domain" }
+codex-adapter = { path = "../codex-adapter" }
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+windows-platform = { path = "../windows-platform" }
+zeroize = "=1.8.2"
+
+[lints]
+workspace = true

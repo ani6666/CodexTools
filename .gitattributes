@@ -1,4 +1,4 @@
-# 默认自动识别文本文件，并在仓库中统一使用 LF
+# 默认自动识别文本文件，并在仓库中统一使用 LF。
 * text=auto
 
 *.md text eol=lf
@@ -13,13 +13,14 @@
 *.html text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
-
-# Windows 脚本使用 CRLF
-*.ps1 text eol=crlf
+*.ps1 text eol=lf
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
-# 二进制证据文件
+# M1 固定样本需要逐字节保留 CRLF，不能套用通用 TOML LF 规则。
+tests/fixtures/g2-oauth/config.toml -text
+
+# 二进制资源不执行文本转换。
 *.png binary
 *.jpg binary
 *.jpeg binary

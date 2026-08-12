@@ -10,10 +10,11 @@ pnpm-debug.log*
 target/
 src-tauri/target/
 
-# 本地环境与凭据
+# 本地环境与秘密
 .env
 .env.*
 !.env.example
+*.local
 secrets/
 validation/secrets/
 *.key
@@ -21,11 +22,25 @@ validation/secrets/
 *.pfx
 *.p12
 
-# Codex / Git Worktree 临时目录
+# Codex 本地日志、临时文件和工作树
+.codex-log/
+.local/
+.tmp/
+tmp/
 .worktrees/
 
-# 内部规划文档与开发验证输出不进入公开仓库
+# 本地 Codex 协作与开发资料
+.codex/
+.agents/
+AGENTS.md
+AGENTS.override.md
+
+# 内部设计、规划与仓库维护资料
+docs/
 /Docs/
+CONTRIBUTING.md
+scripts/
+.github/
 /validation/evidence/
 
 # 编辑器与操作系统

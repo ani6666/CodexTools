@@ -1,0 +1,14 @@
+[package]
+name = "codex-adapter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "CodexTools 只读 Codex 目录扫描与纯内存配置规划"
+
+[dependencies]
+codex-application = { path = "../codex-application" }
+codex-domain = { path = "../codex-domain" }
+
+[lints]
+workspace = true

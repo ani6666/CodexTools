@@ -1,0 +1,10 @@
+# 固定样本：OAuth 结构为合成数据
+model = "gpt-SAMPLE-2"
+model_provider = "sample" # 保留行尾注释
+unknown_future_key = "KEEP_ME"
+
+[model_providers.sample]
+name = "Sample Provider"
+base_url = "https://HOST/v1"
+env_key = "API_KEY_ENV"
+unknown_provider_option = true

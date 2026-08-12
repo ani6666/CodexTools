@@ -1,0 +1,13 @@
+﻿# 固定样本：键形状来自本机脱敏指纹，值均为合成数据
+model = "gpt-SAMPLE-3"
+model_provider = "sample"
+unknown_future_key = "KEEP_ME"
+
+[model_providers.sample]
+name = "Sample Provider"
+base_url = "https://HOST/v1"
+env_key = "API_KEY_ENV"
+unknown_provider_option = true
+
+[features]
+apps = true
