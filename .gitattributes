@@ -1,10 +1,29 @@
+# 默认自动识别文本文件，并在仓库中统一使用 LF。
 * text=auto
 
 *.md text eol=lf
+*.json text eol=lf
 *.toml text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.ps1 text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
 
 # M1 固定样本需要逐字节保留 CRLF，不能套用通用 TOML LF 规则。
 tests/fixtures/g2-oauth/config.toml -text
+
+# 二进制资源不执行文本转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

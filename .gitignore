@@ -1,18 +1,35 @@
+# Node.js / 前端构建
+node_modules/
+dist/
+.vite/
+coverage/
+npm-debug.log*
+pnpm-debug.log*
+
+# Rust / Tauri 构建
+target/
+src-tauri/target/
+
 # 本地环境与秘密
 .env
 .env.*
 !.env.example
 *.local
+secrets/
+validation/secrets/
+*.key
+*.pem
+*.pfx
+*.p12
 
-# Codex 本地日志与临时文件
+# Codex 本地日志、临时文件和工作树
 .codex-log/
 .local/
 .tmp/
 tmp/
-/target/
+.worktrees/
 
 # 本地 Codex 协作与开发资料
-# 这些内容服务于本机开发流程，不属于开源项目交付物。
 .codex/
 .agents/
 AGENTS.md
@@ -20,12 +37,26 @@ AGENTS.override.md
 
 # 内部设计、规划与仓库维护资料
 docs/
+/Docs/
 CONTRIBUTING.md
 scripts/
 .github/
+/validation/evidence/
 
-# 常见编辑器与操作系统文件
+# 编辑器与操作系统
 .idea/
 .vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*
