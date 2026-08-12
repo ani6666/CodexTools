@@ -5,3 +5,6 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.ps1 text eol=lf
+
+# M1 固定样本需要逐字节保留 CRLF，不能套用通用 TOML LF 规则。
+tests/fixtures/g2-oauth/config.toml -text

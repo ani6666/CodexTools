@@ -1,0 +1,13 @@
+[package]
+name = "codex-domain"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "CodexTools 的无 UI、无 I/O 领域核心"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
