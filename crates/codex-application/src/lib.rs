@@ -10,6 +10,8 @@ use codex_domain::{
 
 pub mod codex;
 pub use codex::*;
+mod capture_import;
+pub use capture_import::*;
 mod backup;
 pub use backup::*;
 mod credential_store;

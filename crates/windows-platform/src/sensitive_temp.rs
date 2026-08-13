@@ -115,8 +115,25 @@ mod imp {
     impl RootNamespacePin {
         pub fn acquire(root: &Path) -> io::Result<Self> {
             validate_explicit_root(root)?;
+            let direct = create_file(
+                root,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )?;
+            let direct_metadata = direct.metadata()?;
+            if !direct_metadata.is_dir()
+                || direct_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(invalid_data("root path is a reparse directory"));
+            }
             let canonical = std::fs::canonicalize(root)?;
-            Self::acquire_canonical(&canonical)
+            let pin = Self::acquire_canonical(&canonical)?;
+            if file_identity(&direct)? != pin.identity {
+                return Err(invalid_data("root path identity changed during pin"));
+            }
+            Ok(pin)
         }
 
         pub fn acquire_canonical(canonical: &Path) -> io::Result<Self> {
@@ -180,6 +197,24 @@ mod imp {
                 return Err(invalid_data("root identity changed"));
             }
             Ok(())
+        }
+
+        pub fn relative_directory_is_empty(&self, basename: &str) -> io::Result<bool> {
+            validate_basename(basename)?;
+            self.verify_identity()?;
+            let path = self.final_path.join(basename);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_dir()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    {
+                        return Err(invalid_data("relative path is not a plain directory"));
+                    }
+                    Ok(std::fs::read_dir(path)?.next().transpose()?.is_none())
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            }
         }
 
         pub fn observe_relative(
@@ -584,6 +619,40 @@ mod imp {
                 basename: basename.to_owned(),
                 identity,
             })
+        }
+
+        /// 为受控联合快照持有只读且禁止写入/删除共享的稳定句柄。
+        pub fn open_stable_read(root: &RootNamespacePin, basename: &str) -> io::Result<Self> {
+            validate_basename(basename)?;
+            root.verify_identity()?;
+            let file = create_file(
+                &root.final_path.join(basename),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(invalid_data("stable input is not a non-reparse file"));
+            }
+            verify_parent_identity(&file, root)?;
+            let identity = file_identity(&file)?;
+            Ok(Self {
+                file,
+                basename: basename.to_owned(),
+                identity,
+            })
+        }
+
+        pub fn verify_identity(&self, root: &RootNamespacePin) -> io::Result<()> {
+            root.verify_identity()?;
+            verify_parent_identity(&self.file, root)?;
+            if file_identity(&self.file)? != self.identity {
+                return Err(invalid_data("stable input identity changed"));
+            }
+            Ok(())
         }
 
         pub fn open_for_delete(
@@ -1122,6 +1191,15 @@ mod imp_non_windows {
                 "Windows sensitive-temp support is required",
             ))
         }
+        pub fn final_path(&self) -> &Path {
+            Path::new("")
+        }
+        pub fn relative_directory_is_empty(&self, _: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows root-relative directory validation is required",
+            ))
+        }
     }
     #[derive(Debug)]
     pub struct SensitiveTempFile;
@@ -1138,6 +1216,38 @@ mod imp_non_windows {
     }
     #[derive(Debug)]
     pub struct PinnedLiveFile;
+    impl PinnedLiveFile {
+        pub fn open_stable_read(_: &RootNamespacePin, _: &str) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub fn verify_identity(&self, _: &RootNamespacePin) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub const fn identity(&self) -> FileIdentity128 {
+            FileIdentity128 {
+                volume_serial_number: 0,
+                file_id: [0; 16],
+            }
+        }
+        pub fn length(&self) -> io::Result<u64> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub fn reread(&mut self, _: u64) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+    }
     pub fn probe_sensitive_temp_capabilities(_: &RootNamespacePin) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

@@ -213,8 +213,19 @@ pub fn import_scanned_identity<R: IdentityBundleRepository>(
     actual: &ActualCodexState,
     input: ImportIdentityInput,
 ) -> Result<ImportOutcome, ApplicationError> {
-    let Some(credential) = input.credential else {
+    let Some(bundle) = build_scanned_identity_bundle(actual, input)? else {
         return Ok(ImportOutcome::CredentialCaptureRequired);
+    };
+    repository.create_identity_bundle(&bundle)?;
+    Ok(ImportOutcome::Imported)
+}
+
+pub fn build_scanned_identity_bundle(
+    actual: &ActualCodexState,
+    input: ImportIdentityInput,
+) -> Result<Option<IdentityBundle>, ApplicationError> {
+    let Some(credential) = input.credential else {
+        return Ok(None);
     };
     if AuthMode::from(credential.kind()) != actual.authentication.auth_mode
         || credential.credential_fingerprint() != &actual.authentication.credential_fingerprint
@@ -246,13 +257,12 @@ pub fn import_scanned_identity<R: IdentityBundleRepository>(
         actual.config.baseline_sha256.clone(),
         input.now,
     );
-    repository.create_identity_bundle(&IdentityBundle {
+    Ok(Some(IdentityBundle {
         credential_to_create: (!input.credential_already_persisted).then_some(credential),
         identity,
         preset,
         patch,
-    })?;
-    Ok(ImportOutcome::Imported)
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

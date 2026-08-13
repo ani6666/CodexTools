@@ -5,17 +5,21 @@ use std::{
 
 use codex_application::{
     BackupKind, BackupRecord, BackupRecoveryOperation, BackupRecoveryPhase, BackupRecoveryRecord,
-    BackupRepository, BackupState, CredentialRecoveryOperation, CredentialRecoveryPhase,
-    CredentialRecoveryRecord, CredentialRecoveryRepository, CredentialReferenceRepository,
-    EntityKind, IdentityCandidateQuery, ModelPresetRepository, RepositoryError,
-    RuntimeIdentityRepository, SwitchErrorCode, SwitchRecoveryDiagnostic, SwitchTransactionRecord,
+    BackupRepository, BackupState, CaptureImportCredentialOrigin, CaptureImportDiagnostic,
+    CaptureImportPhase, CaptureImportRecoveryRecord, CaptureImportRecoveryRepository,
+    ControlledRoot, ControlledScanId,
+    CredentialRecoveryOperation, CredentialRecoveryPhase, CredentialRecoveryRecord,
+    CredentialRecoveryRepository, CredentialReferenceRepository, EntityKind,
+    IdentityCandidateQuery, ModelPresetRepository, RepositoryError, RuntimeIdentityRepository,
+    SwitchErrorCode, SwitchRecoveryDiagnostic, SwitchTransactionRecord,
     SwitchTransactionRepository,
 };
 use codex_domain::{
     AuthMode, ContentHash, CredentialBackend, CredentialFingerprint, CredentialKind,
     CredentialLink, CredentialRefId, CredentialReference, EndpointUrl, EntityName, EntityVersion,
-    IdentityId, IdentityStatus, ModelId, ModelPreset, ModelPresetId, ProviderId, RuntimeIdentity,
-    SchemaFingerprint, SwitchTransaction, SwitchTransactionId, SwitchTransactionState, UnixMillis,
+    IdentityId, IdentityStatus, ManagedConfigPatchId, ModelId, ModelPreset, ModelPresetId,
+    ProviderId, RuntimeIdentity, SchemaFingerprint, SwitchTransaction, SwitchTransactionId,
+    SwitchTransactionState, UnixMillis,
 };
 use rusqlite::{
     Connection, Error as SqlError, ErrorCode, OptionalExtension, Row, TransactionBehavior, params,
@@ -222,6 +226,7 @@ impl SqliteMetadataRepository {
         migrate(&mut connection).map_err(OpenRepositoryError::Migration)?;
         let repository = Self { connection };
         repository.audit_switch_transactions()?;
+        repository.audit_capture_import_schema()?;
         Ok(repository)
     }
 
@@ -664,6 +669,112 @@ impl SqliteMetadataRepository {
         }
         Ok(())
     }
+
+    fn audit_capture_import_schema(&self) -> Result<(), OpenRepositoryError> {
+        let version: i64 = self
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        if version < 11 {
+            return Ok(());
+        }
+        let table_sql: String = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='capture_import_operations'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        let expected_table = crate::migration::MIGRATION_0011_SQL
+            .split_once(";\n\nCREATE INDEX")
+            .map(|(table, _)| table)
+            .ok_or(OpenRepositoryError::CorruptData)?;
+        if normalize_schema_sql(&table_sql) != normalize_schema_sql(expected_table) {
+            return Err(OpenRepositoryError::CorruptData);
+        }
+        let index_sql: String = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_capture_import_unfinished'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        let expected_index = crate::migration::MIGRATION_0011_SQL
+            .split_once("CREATE INDEX")
+            .map(|(_, index)| format!("CREATE INDEX{index}"))
+            .ok_or(OpenRepositoryError::CorruptData)?;
+        if normalize_schema_sql(&index_sql) != normalize_schema_sql(&expected_index) {
+            return Err(OpenRepositoryError::CorruptData);
+        }
+        let strict: i64 = self
+            .connection
+            .query_row(
+                "SELECT strict FROM pragma_table_list WHERE schema='main' AND name='capture_import_operations'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        if strict != 1 {
+            return Err(OpenRepositoryError::CorruptData);
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master
+                 WHERE (tbl_name='capture_import_operations'
+                        OR name='capture_import_operations'
+                        OR (type='view' AND lower(sql) LIKE '%capture_import_operations%'))
+                   AND name NOT LIKE 'sqlite_autoindex_%'
+                 ORDER BY type,name",
+            )
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        let objects = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|_| OpenRepositoryError::CorruptData)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        if objects.len() != 2
+            || objects.iter().any(|(kind, name, table, sql)| match kind.as_str() {
+                "table" => {
+                    name != "capture_import_operations"
+                        || table != "capture_import_operations"
+                        || sql.as_deref().is_none_or(|value| {
+                            normalize_schema_sql(value) != normalize_schema_sql(expected_table)
+                        })
+                }
+                "index" => {
+                    name != "idx_capture_import_unfinished"
+                        || table != "capture_import_operations"
+                        || sql.as_deref().is_none_or(|value| {
+                            normalize_schema_sql(value) != normalize_schema_sql(&expected_index)
+                        })
+                }
+                _ => true,
+            })
+        {
+            return Err(OpenRepositoryError::CorruptData);
+        }
+        Ok(())
+    }
+}
+
+fn normalize_schema_sql(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != ';')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl CredentialReferenceRepository for SqliteMetadataRepository {
@@ -1532,6 +1643,275 @@ impl CredentialRecoveryRepository for SqliteMetadataRepository {
             ));
         }
         Ok(())
+    }
+}
+
+impl CaptureImportRecoveryRepository for SqliteMetadataRepository {
+    fn create_capture_import_recovery(
+        &mut self,
+        record: &CaptureImportRecoveryRecord,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RepositoryError::storage_unavailable())?;
+        transaction
+            .execute(
+                "INSERT INTO capture_import_operations(
+                    operation_id,root_selector,scan_id,credential_id,identity_id,identity_name,
+                    preset_id,preset_name,patch_id,auth_mode,auth_schema_fingerprint,
+                    credential_origin,credential_backend,credential_schema_fingerprint,
+                    credential_fingerprint,credential_version,credential_created_at_unix_ms,
+                    credential_updated_at_unix_ms,provider_id,provider_display_name,api_base_url,
+                    model_id,config_hash,phase,diagnostic_code,created_at_unix_ms,
+                    updated_at_unix_ms,version
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+                params![
+                    record.operation_id,
+                    record.root.as_storage_str(),
+                    record.scan_id.as_hash().as_str(),
+                    record.credential_id.as_str(),
+                    record.identity_id.as_str(),
+                    record.identity_name.as_str(),
+                    record.preset_id.as_str(),
+                    record.preset_name.as_str(),
+                    record.patch_id.as_str(),
+                    record.auth_mode.as_storage_str(),
+                    record.auth_schema_fingerprint.as_str(),
+                    capture_import_origin_str(record.credential_origin),
+                    record.credential_backend.as_storage_str(),
+                    record.credential_schema_fingerprint.as_str(),
+                    record.credential_fingerprint.as_str(),
+                    version_to_i64(record.credential_version),
+                    record.credential_created_at.value(),
+                    record.credential_updated_at.value(),
+                    record.provider_id.as_str(),
+                    record.provider_display_name.as_str(),
+                    record.api_base_url.as_str(),
+                    record.model_id.as_str(),
+                    record.config_hash.as_str(),
+                    capture_import_phase_str(record.phase),
+                    record.diagnostic.map(capture_import_diagnostic_str),
+                    record.created_at.value(),
+                    record.updated_at.value(),
+                    version_to_i64(record.version),
+                ],
+            )
+            .map_err(|error| map_write_error(error, EntityKind::RuntimeIdentity, None))?;
+        if get_capture_import_recovery_on(&transaction, &record.operation_id)?.as_ref()
+            != Some(record)
+        {
+            return Err(RepositoryError::corrupt_data());
+        }
+        transaction
+            .commit()
+            .map_err(|_| RepositoryError::storage_unavailable())
+    }
+
+    fn get_capture_import_recovery(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<CaptureImportRecoveryRecord>, RepositoryError> {
+        get_capture_import_recovery_on(&self.connection, operation_id)
+    }
+
+    fn update_capture_import_recovery(
+        &mut self,
+        record: &CaptureImportRecoveryRecord,
+        expected_version: EntityVersion,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RepositoryError::storage_unavailable())?;
+        let changed = transaction
+            .execute(
+                "UPDATE capture_import_operations
+                 SET phase=?2,diagnostic_code=?3,updated_at_unix_ms=?4,version=?5
+                 WHERE operation_id=?1 AND version=?6",
+                params![
+                    record.operation_id,
+                    capture_import_phase_str(record.phase),
+                    record.diagnostic.map(capture_import_diagnostic_str),
+                    record.updated_at.value(),
+                    version_to_i64(record.version),
+                    version_to_i64(expected_version),
+                ],
+            )
+            .map_err(|_| RepositoryError::storage_unavailable())?;
+        if changed == 0 {
+            return Err(RepositoryError::version_conflict(
+                EntityKind::RuntimeIdentity,
+            ));
+        }
+        if get_capture_import_recovery_on(&transaction, &record.operation_id)?.as_ref()
+            != Some(record)
+        {
+            return Err(RepositoryError::corrupt_data());
+        }
+        transaction
+            .commit()
+            .map_err(|_| RepositoryError::storage_unavailable())
+    }
+
+    fn delete_capture_import_recovery(
+        &mut self,
+        operation_id: &str,
+        expected_version: EntityVersion,
+    ) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RepositoryError::storage_unavailable())?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM capture_import_operations WHERE operation_id=?1 AND version=?2",
+                params![operation_id, version_to_i64(expected_version)],
+            )
+            .map_err(|_| RepositoryError::storage_unavailable())?;
+        if changed == 0 {
+            return Err(RepositoryError::version_conflict(
+                EntityKind::RuntimeIdentity,
+            ));
+        }
+        if get_capture_import_recovery_on(&transaction, operation_id)?.is_some() {
+            return Err(RepositoryError::corrupt_data());
+        }
+        transaction
+            .commit()
+            .map_err(|_| RepositoryError::storage_unavailable())
+    }
+}
+
+fn get_capture_import_recovery_on(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<CaptureImportRecoveryRecord>, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT operation_id,root_selector,scan_id,credential_id,identity_id,identity_name,
+                    preset_id,preset_name,patch_id,auth_mode,auth_schema_fingerprint,
+                    credential_origin,credential_backend,credential_schema_fingerprint,
+                    credential_fingerprint,credential_version,credential_created_at_unix_ms,
+                    credential_updated_at_unix_ms,provider_id,provider_display_name,api_base_url,
+                    model_id,config_hash,phase,diagnostic_code,created_at_unix_ms,
+                    updated_at_unix_ms,version
+             FROM capture_import_operations WHERE operation_id=?1",
+            [operation_id],
+            capture_import_recovery_from_row,
+        )
+        .optional()
+        .map_err(|_| RepositoryError::corrupt_data())
+}
+
+fn capture_import_recovery_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<CaptureImportRecoveryRecord> {
+    let auth_mode = match row.get::<_, String>(9)?.as_str() {
+        "api_key" => AuthMode::ApiKey,
+        "oauth" => AuthMode::OAuth,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let credential_origin = match row.get::<_, String>(11)?.as_str() {
+        "created" => CaptureImportCredentialOrigin::Created,
+        "reused" => CaptureImportCredentialOrigin::Reused,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let credential_backend = CredentialBackend::from_storage(&row.get::<_, String>(12)?)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let phase = match row.get::<_, String>(23)?.as_str() {
+        "prepared" => CaptureImportPhase::Prepared,
+        "credential_ready" => CaptureImportPhase::CredentialReady,
+        "bundle_ready" => CaptureImportPhase::BundleReady,
+        "recovery_required" => CaptureImportPhase::RecoveryRequired,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let diagnostic = row
+        .get::<_, Option<String>>(24)?
+        .map(|value| match value.as_str() {
+            "journal_unavailable" => Ok(CaptureImportDiagnostic::JournalUnavailable),
+            "credential_pending" => Ok(CaptureImportDiagnostic::CredentialPending),
+            "bundle_pending" => Ok(CaptureImportDiagnostic::BundlePending),
+            "cleanup_pending" => Ok(CaptureImportDiagnostic::CleanupPending),
+            "inconsistent_state" => Ok(CaptureImportDiagnostic::InconsistentState),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        })
+        .transpose()?;
+    Ok(CaptureImportRecoveryRecord {
+        operation_id: row.get(0)?,
+        root: ControlledRoot::from_storage(&row.get::<_, String>(1)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        scan_id: ControlledScanId::parse(&row.get::<_, String>(2)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_id: CredentialRefId::parse(&row.get::<_, String>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        identity_id: IdentityId::parse(&row.get::<_, String>(4)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        identity_name: EntityName::parse(&row.get::<_, String>(5)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        preset_id: ModelPresetId::parse(&row.get::<_, String>(6)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        preset_name: EntityName::parse(&row.get::<_, String>(7)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        patch_id: ManagedConfigPatchId::parse(&row.get::<_, String>(8)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        auth_mode,
+        auth_schema_fingerprint: SchemaFingerprint::parse(&row.get::<_, String>(10)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_origin,
+        credential_backend,
+        credential_schema_fingerprint: SchemaFingerprint::parse(&row.get::<_, String>(13)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_fingerprint: CredentialFingerprint::parse(&row.get::<_, String>(14)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_version: EntityVersion::new(row.get::<_, u64>(15)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_created_at: UnixMillis::new(row.get(16)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        credential_updated_at: UnixMillis::new(row.get(17)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider_id: ProviderId::parse(&row.get::<_, String>(18)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider_display_name: EntityName::parse(&row.get::<_, String>(19)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        api_base_url: EndpointUrl::parse(&row.get::<_, String>(20)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        model_id: ModelId::parse(&row.get::<_, String>(21)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        config_hash: ContentHash::parse(&row.get::<_, String>(22)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        phase,
+        diagnostic,
+        created_at: UnixMillis::new(row.get(25)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        updated_at: UnixMillis::new(row.get(26)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        version: EntityVersion::new(row.get::<_, u64>(27)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
+}
+
+const fn capture_import_phase_str(value: CaptureImportPhase) -> &'static str {
+    match value {
+        CaptureImportPhase::Prepared => "prepared",
+        CaptureImportPhase::CredentialReady => "credential_ready",
+        CaptureImportPhase::BundleReady => "bundle_ready",
+        CaptureImportPhase::RecoveryRequired => "recovery_required",
+    }
+}
+
+const fn capture_import_origin_str(value: CaptureImportCredentialOrigin) -> &'static str {
+    match value {
+        CaptureImportCredentialOrigin::Created => "created",
+        CaptureImportCredentialOrigin::Reused => "reused",
+    }
+}
+
+const fn capture_import_diagnostic_str(value: CaptureImportDiagnostic) -> &'static str {
+    match value {
+        CaptureImportDiagnostic::JournalUnavailable => "journal_unavailable",
+        CaptureImportDiagnostic::CredentialPending => "credential_pending",
+        CaptureImportDiagnostic::BundlePending => "bundle_pending",
+        CaptureImportDiagnostic::CleanupPending => "cleanup_pending",
+        CaptureImportDiagnostic::InconsistentState => "inconsistent_state",
     }
 }
 

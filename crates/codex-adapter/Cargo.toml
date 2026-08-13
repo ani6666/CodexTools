@@ -9,6 +9,7 @@ description = "CodexTools 只读 Codex 目录扫描与纯内存配置规划"
 [dependencies]
 codex-application = { path = "../codex-application" }
 codex-domain = { path = "../codex-domain" }
+zeroize = "=1.8.2"
 
 [lints]
 workspace = true

@@ -20,7 +20,8 @@ pub use switch::{FileRole, SwitchTransaction, SwitchTransactionState};
 pub use value::{
     ContentHash, CredentialFingerprint, CredentialRefId, EndpointUrl, EntityName, EntityVersion,
     IdentityId, ManagedConfigPatchId, ModelId, ModelPresetId, ProviderId, SchemaFingerprint,
-    SwitchTransactionId, UnixMillis,
+    SwitchTransactionId, UnixMillis, contains_high_confidence_secret,
+    contains_high_confidence_secret_bytes,
 };
 
 /// 当前核心实现所达到的里程碑阶段。

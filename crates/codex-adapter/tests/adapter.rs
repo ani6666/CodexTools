@@ -298,6 +298,28 @@ fn auth_json_accepts_valid_utf8_numbers_and_escapes() {
 }
 
 #[test]
+fn auth_json_rejects_unicode_escape_equivalent_duplicate_keys() {
+    let adapter = CodexAdapter::new();
+    let config = fixture("g1-api-key", "config.toml");
+    let duplicates = [
+        br#"{"OPENAI_API_KEY":"TOKEN","\u004fPENAI_API_KEY":"TOKEN"}"#.as_slice(),
+        br#"{"\u004fPENAI_API_KEY":"TOKEN","OPENAI_API_KEY":"TOKEN"}"#.as_slice(),
+        br#"{"tokens":{"id_token":"ID","\u0069d_token":"ID","access_token":"ACCESS","refresh_token":"REFRESH","account_id":"ACCOUNT"}}"#.as_slice(),
+        br#"{"tokens":{"id_token":"ID","access_token":"ACCESS","refresh_token":"REFRESH","account_id":"ACCOUNT"},"\u0074okens":{"id_token":"ID","access_token":"ACCESS","refresh_token":"REFRESH","account_id":"ACCOUNT"}}"#.as_slice(),
+    ];
+    for (index, auth) in duplicates.into_iter().enumerate() {
+        let home = TempHome::new(&format!("unicode-equivalent-duplicate-{index}"));
+        home.write(&config, auth);
+        assert!(matches!(
+            adapter.scan_explicit_root(home.path()),
+            ScanStatus::CompatibilityProtected(
+                CompatibilityReason::UnknownAuthenticationShape
+            )
+        ));
+    }
+}
+
+#[test]
 fn private_key_headers_in_unknown_config_are_compatibility_protected() {
     let adapter = CodexAdapter::new();
     let auth = br#"{"OPENAI_API_KEY":"TOKEN"}"#;
@@ -370,3 +392,4 @@ fn cross_provider_planning_requires_predeclared_table_and_preserves_both_tables(
     assert!(target_a.contains("model_provider = \"a\""));
     assert!(target_a.contains("model = \"model-a\""));
 }
+use zeroize as _;

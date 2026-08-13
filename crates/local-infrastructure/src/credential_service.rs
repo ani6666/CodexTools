@@ -5,16 +5,16 @@ use std::{
 
 use codex_adapter::hash_bytes;
 use codex_application::{
-    BoundSecretConsumer, CredentialEnvelopeBinding, CredentialMaterialDiagnostic,
-    CredentialRecoveryOperation, CredentialRecoveryPhase, CredentialRecoveryRecord,
-    CredentialRecoveryRepository, CredentialReferenceRepository, CredentialStore,
-    CredentialStoreError, RepositoryError, SecretConsumer,
+    BoundSecretConsumer, CaptureImportCredentialOrigin, CredentialEnvelopeBinding,
+    CredentialMaterialDiagnostic, CredentialRecoveryOperation, CredentialRecoveryPhase,
+    CredentialRecoveryRecord, CredentialRecoveryRepository, CredentialReferenceRepository,
+    CredentialStore, CredentialStoreError, RepositoryError, SecretConsumer,
 };
 use codex_domain::{
     CredentialBackend, CredentialFingerprint, CredentialKind, CredentialRefId, CredentialReference,
     EntityVersion, SchemaFingerprint, UnixMillis,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialServiceError {
@@ -26,6 +26,12 @@ pub enum CredentialServiceError {
     StoreFailure,
     RepositoryFailure,
     RecoveryRequired,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ScopedCredentialError<E> {
+    Credential(CredentialServiceError),
+    Operation(E),
 }
 
 impl fmt::Display for CredentialServiceError {
@@ -49,6 +55,11 @@ pub struct CredentialService<'a, R, S> {
     store: &'a mut S,
 }
 
+enum PlannedCapture {
+    Created(CredentialReference),
+    Reused(CredentialReference),
+}
+
 impl<'a, R, S> CredentialService<'a, R, S>
 where
     R: CredentialReferenceRepository + CredentialRecoveryRepository,
@@ -64,7 +75,7 @@ where
         secret: &mut [u8],
         now: UnixMillis,
     ) -> Result<CredentialReference, CredentialServiceError> {
-        self.create(id, CredentialKind::ApiKey, secret, now)
+        self.create(id, CredentialKind::ApiKey, secret, now, SecretInput::Direct)
     }
 
     pub fn create_oauth_bundle(
@@ -73,7 +84,190 @@ where
         secret: &mut [u8],
         now: UnixMillis,
     ) -> Result<CredentialReference, CredentialServiceError> {
-        self.create(id, CredentialKind::OAuthBundle, secret, now)
+        self.create(
+            id,
+            CredentialKind::OAuthBundle,
+            secret,
+            now,
+            SecretInput::Direct,
+        )
+    }
+
+    /// 捕获完整、已扫描确认的 auth 文档；该入口供受控根组合服务使用。
+    pub fn capture_auth_document(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        auth_document: &mut [u8],
+        now: UnixMillis,
+    ) -> Result<CredentialReference, CredentialServiceError> {
+        self.create(id, kind, auth_document, now, SecretInput::AuthDocument)
+    }
+
+    /// 在单一跨进程 credential owner 内完成 capture 与调用方的条件提交。
+    pub fn capture_auth_document_scoped<T, E, F>(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        auth_document: &mut [u8],
+        now: UnixMillis,
+        operation: F,
+    ) -> Result<T, ScopedCredentialError<E>>
+    where
+        F: FnOnce(&mut R, &mut S, &CredentialReference) -> Result<T, E>,
+    {
+        let owner = match self.store.begin_mutation(&id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                auth_document.zeroize();
+                return Err(ScopedCredentialError::Credential(map_store_error(error)));
+            }
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.create_locked(id, kind, auth_document, now, SecretInput::AuthDocument)
+                .map_err(ScopedCredentialError::Credential)
+                .and_then(|reference| {
+                    operation(self.repository, self.store, &reference)
+                        .map_err(ScopedCredentialError::Operation)
+                })
+        }));
+        let released = self.store.end_mutation(owner);
+        auth_document.zeroize();
+        match result {
+            Err(payload) => resume_unwind(payload),
+            Ok(_) if released.is_err() => Err(ScopedCredentialError::Credential(
+                CredentialServiceError::RecoveryRequired,
+            )),
+            Ok(result) => result,
+        }
+    }
+
+    /// 在同一个 owner 内先确定 created/reused 并持久化调用方 intent，再发布新材料。
+    pub fn capture_auth_document_scoped_prepared<P, T, E, Prepare, Operation>(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        auth_document: &mut [u8],
+        now: UnixMillis,
+        prepare: Prepare,
+        operation: Operation,
+    ) -> Result<T, ScopedCredentialError<E>>
+    where
+        Prepare: FnOnce(
+            &mut R,
+            &mut S,
+            CaptureImportCredentialOrigin,
+            &CredentialReference,
+        ) -> Result<P, E>,
+        Operation: FnOnce(
+            &mut R,
+            &mut S,
+            &CredentialReference,
+            P,
+        ) -> Result<T, E>,
+    {
+        let owner = match self.store.begin_mutation(&id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                auth_document.zeroize();
+                return Err(ScopedCredentialError::Credential(map_store_error(error)));
+            }
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.capture_auth_document_prepared_under_owner(
+                id,
+                kind,
+                auth_document,
+                now,
+                prepare,
+                operation,
+            )
+        }));
+        let released = self.store.end_mutation(owner);
+        auth_document.zeroize();
+        match result {
+            Err(payload) => resume_unwind(payload),
+            Ok(_) if released.is_err() => Err(ScopedCredentialError::Credential(
+                CredentialServiceError::RecoveryRequired,
+            )),
+            Ok(result) => result,
+        }
+    }
+
+    /// 复用调用方已持有的 credential owner；不得在该作用域内再次 begin mutation。
+    pub(crate) fn capture_auth_document_prepared_under_owner<P, T, E, Prepare, Operation>(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        auth_document: &mut [u8],
+        now: UnixMillis,
+        prepare: Prepare,
+        operation: Operation,
+    ) -> Result<T, ScopedCredentialError<E>>
+    where
+        Prepare: FnOnce(
+            &mut R,
+            &mut S,
+            CaptureImportCredentialOrigin,
+            &CredentialReference,
+        ) -> Result<P, E>,
+        Operation: FnOnce(
+            &mut R,
+            &mut S,
+            &CredentialReference,
+            P,
+        ) -> Result<T, E>,
+    {
+        let result = (|| {
+            let planned = self
+                .plan_capture_locked(id, kind, auth_document, now)
+                .map_err(ScopedCredentialError::Credential)?;
+            let (origin, reference) = match &planned {
+                PlannedCapture::Created(reference) => {
+                    (CaptureImportCredentialOrigin::Created, reference)
+                }
+                PlannedCapture::Reused(reference) => {
+                    (CaptureImportCredentialOrigin::Reused, reference)
+                }
+            };
+            let prepared = prepare(self.repository, self.store, origin, reference)
+                .map_err(ScopedCredentialError::Operation)?;
+            let reference = match planned {
+                PlannedCapture::Created(reference) => self
+                    .persist_created_capture_locked(reference, auth_document, now)
+                    .map_err(ScopedCredentialError::Credential)?,
+                PlannedCapture::Reused(reference) => reference,
+            };
+            operation(self.repository, self.store, &reference, prepared)
+                .map_err(ScopedCredentialError::Operation)
+        })();
+        auth_document.zeroize();
+        result
+    }
+
+    pub(crate) fn with_mutation_owner_scoped<T, E, F>(
+        &mut self,
+        id: &CredentialRefId,
+        operation: F,
+    ) -> Result<T, ScopedCredentialError<E>>
+    where
+        F: FnOnce(&mut R, &mut S) -> Result<T, E>,
+    {
+        let owner = self
+            .store
+            .begin_mutation(id)
+            .map_err(|error| ScopedCredentialError::Credential(map_store_error(error)))?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            operation(self.repository, self.store).map_err(ScopedCredentialError::Operation)
+        }));
+        let released = self.store.end_mutation(owner);
+        match result {
+            Err(payload) => resume_unwind(payload),
+            Ok(_) if released.is_err() => Err(ScopedCredentialError::Credential(
+                CredentialServiceError::RecoveryRequired,
+            )),
+            Ok(result) => result,
+        }
     }
 
     fn create(
@@ -82,6 +276,7 @@ where
         kind: CredentialKind,
         secret: &mut [u8],
         now: UnixMillis,
+        input: SecretInput,
     ) -> Result<CredentialReference, CredentialServiceError> {
         let owner = match self.store.begin_mutation(&id) {
             Ok(owner) => owner,
@@ -90,38 +285,113 @@ where
                 return Err(map_store_error(error));
             }
         };
-        let result = (|| {
-            validate_secret(kind, secret)?;
-            let schema = schema_fingerprint(kind);
-            let fingerprint = credential_fingerprint(secret);
-            let reference = CredentialReference::new(
-                id,
-                kind,
-                CredentialBackend::WindowsDpapiCurrentUser,
-                schema.clone(),
-                fingerprint,
-                now,
-            );
-            let reference = self.reference_with_recovery_timestamps(
-                reference,
-                CredentialRecoveryOperation::Create,
-            )?;
-            let binding = binding(&reference);
-            if let Some(existing) = self
-                .repository
-                .get_credential_reference(reference.id())
-                .map_err(map_repository_error)?
-            {
-                if same_reference_material(&existing, &reference) {
-                    self.clear_matching_recovery(
-                        reference.id(),
-                        CredentialRecoveryOperation::Create,
-                        reference.version(),
-                    )?;
-                    return Ok(existing);
-                }
+        let result = self.create_locked(id, kind, secret, now, input);
+        let released = self.store.end_mutation(owner);
+        secret.zeroize();
+        if released.is_err() {
+            Err(CredentialServiceError::RecoveryRequired)
+        } else {
+            result
+        }
+    }
+
+    fn create_locked(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        secret: &mut [u8],
+        now: UnixMillis,
+        input: SecretInput,
+    ) -> Result<CredentialReference, CredentialServiceError> {
+        match input {
+            SecretInput::Direct if kind == CredentialKind::ApiKey => {
+                validate_secret(kind, secret)?;
+                let mut document = api_key_auth_document(secret)?;
+                secret.zeroize();
+                return self.create_material_locked(id, kind, &mut document, now);
+            }
+            SecretInput::Direct => validate_secret(kind, secret)?,
+            SecretInput::AuthDocument => validate_auth_document(kind, secret)?,
+        }
+        self.create_material_locked(id, kind, secret, now)
+    }
+
+    fn create_material_locked(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        secret: &mut [u8],
+        now: UnixMillis,
+    ) -> Result<CredentialReference, CredentialServiceError> {
+        match self.plan_capture_prevalidated_locked(id, kind, secret, now)? {
+            PlannedCapture::Reused(reference) => Ok(reference),
+            PlannedCapture::Created(reference) => {
+                self.persist_created_capture_locked(reference, secret, now)
+            }
+        }
+    }
+
+    fn plan_capture_locked(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        auth_document: &[u8],
+        now: UnixMillis,
+    ) -> Result<PlannedCapture, CredentialServiceError> {
+        validate_auth_document(kind, auth_document)?;
+        self.plan_capture_prevalidated_locked(id, kind, auth_document, now)
+    }
+
+    fn plan_capture_prevalidated_locked(
+        &mut self,
+        id: CredentialRefId,
+        kind: CredentialKind,
+        secret: &[u8],
+        now: UnixMillis,
+    ) -> Result<PlannedCapture, CredentialServiceError> {
+        let reference = CredentialReference::new(
+            id,
+            kind,
+            CredentialBackend::WindowsDpapiCurrentUser,
+            schema_fingerprint(kind),
+            credential_fingerprint(secret),
+            now,
+        );
+        let reference = self.reference_with_recovery_timestamps(
+            reference,
+            CredentialRecoveryOperation::Create,
+        )?;
+        if let Some(existing) = self
+            .repository
+            .get_credential_reference(reference.id())
+            .map_err(map_repository_error)?
+        {
+            if !same_reference_material(&existing, &reference) {
                 return Err(CredentialServiceError::AlreadyExists);
             }
+            if self.material_fingerprint(&binding(&existing))?
+                != *existing.credential_fingerprint()
+            {
+                return Err(CredentialServiceError::RecoveryRequired);
+            }
+            self.clear_matching_recovery(
+                reference.id(),
+                CredentialRecoveryOperation::Create,
+                reference.version(),
+            )?;
+            return Ok(PlannedCapture::Reused(existing));
+        }
+        Ok(PlannedCapture::Created(reference))
+    }
+
+    fn persist_created_capture_locked(
+        &mut self,
+        reference: CredentialReference,
+        secret: &mut [u8],
+        now: UnixMillis,
+    ) -> Result<CredentialReference, CredentialServiceError> {
+        (|| {
+            let binding = binding(&reference);
             let recovery = self.ensure_prepared_recovery(
                 &reference,
                 CredentialRecoveryOperation::Create,
@@ -161,14 +431,7 @@ where
             }
             self.clear_recovery(recovery)?;
             Ok(reference)
-        })();
-        let released = self.store.end_mutation(owner);
-        secret.zeroize();
-        if released.is_err() {
-            Err(CredentialServiceError::RecoveryRequired)
-        } else {
-            result
-        }
+        })()
     }
 
     pub fn rotate_credential(
@@ -191,6 +454,15 @@ where
                 .get_credential_reference(id)
                 .map_err(map_repository_error)?
                 .ok_or(CredentialServiceError::NotFound)?;
+            if current.schema_fingerprint() != &schema_fingerprint(current.kind()) {
+                return Err(CredentialServiceError::RecoveryRequired);
+            }
+            if current.kind() == CredentialKind::ApiKey {
+                validate_secret(current.kind(), secret)?;
+                let mut document = api_key_auth_document(secret)?;
+                secret.zeroize();
+                return self.rotate_material_locked(current, expected_version, &mut document, now);
+            }
             if current.version() != expected_version {
                 validate_secret(current.kind(), secret)?;
                 let fingerprint = credential_fingerprint(secret);
@@ -211,6 +483,43 @@ where
                 return Err(CredentialServiceError::VersionConflict);
             }
             validate_secret(current.kind(), secret)?;
+            self.rotate_material_locked(current, expected_version, secret, now)
+        })();
+        let released = self.store.end_mutation(owner);
+        secret.zeroize();
+        if released.is_err() {
+            Err(CredentialServiceError::RecoveryRequired)
+        } else {
+            result
+        }
+    }
+
+    fn rotate_material_locked(
+        &mut self,
+        current: CredentialReference,
+        expected_version: EntityVersion,
+        secret: &mut [u8],
+        now: UnixMillis,
+    ) -> Result<CredentialReference, CredentialServiceError> {
+        (|| {
+            if current.version() != expected_version {
+                let fingerprint = credential_fingerprint(secret);
+                if current.version().value() == expected_version.value() + 1
+                    && current.credential_fingerprint() == &fingerprint
+                {
+                    let current_binding = binding(&current);
+                    if self.material_fingerprint(&current_binding)? != fingerprint {
+                        return Err(CredentialServiceError::RecoveryRequired);
+                    }
+                    self.clear_matching_recovery(
+                        current.id(),
+                        CredentialRecoveryOperation::Rotate,
+                        current.version(),
+                    )?;
+                    return Ok(current);
+                }
+                return Err(CredentialServiceError::VersionConflict);
+            }
             let next = current
                 .rotate(
                     schema_fingerprint(current.kind()),
@@ -258,14 +567,7 @@ where
             }
             self.clear_recovery(recovery)?;
             Ok(next)
-        })();
-        let released = self.store.end_mutation(owner);
-        secret.zeroize();
-        if released.is_err() {
-            Err(CredentialServiceError::RecoveryRequired)
-        } else {
-            result
-        }
+        })()
     }
 
     pub fn read_for_switch(
@@ -281,6 +583,7 @@ where
                 .get_credential_reference(id)
                 .map_err(map_repository_error)?
                 .ok_or(CredentialServiceError::NotFound)?;
+            ensure_current_material_schema(&reference)?;
             let mut buffered = BufferedSecret::default();
             self.store
                 .read(&binding(&reference), &mut buffered)
@@ -328,6 +631,7 @@ where
                 .get_credential_reference(id)
                 .map_err(map_repository_error)?
                 .ok_or(CredentialServiceError::NotFound)?;
+            ensure_current_material_schema(&reference)?;
             let mut buffered = BufferedSecret::default();
             self.store
                 .read(&binding(&reference), &mut buffered)
@@ -957,6 +1261,12 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+enum SecretInput {
+    Direct,
+    AuthDocument,
+}
+
 struct FingerprintConsumer {
     fingerprint: Option<CredentialFingerprint>,
 }
@@ -964,6 +1274,8 @@ struct FingerprintConsumer {
 #[derive(Default)]
 struct BufferedSecret {
     bytes: Vec<u8>,
+    #[cfg(test)]
+    observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 impl SecretConsumer for BufferedSecret {
     fn consume(&mut self, secret: &[u8]) -> Result<(), CredentialStoreError> {
@@ -975,6 +1287,10 @@ impl SecretConsumer for BufferedSecret {
 impl Drop for BufferedSecret {
     fn drop(&mut self) {
         self.bytes.zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.set(self.bytes.iter().all(|byte| *byte == 0));
+        }
     }
 }
 impl SecretConsumer for FingerprintConsumer {
@@ -1064,12 +1380,41 @@ fn binding(reference: &CredentialReference) -> CredentialEnvelopeBinding {
     )
 }
 
-fn schema_fingerprint(kind: CredentialKind) -> SchemaFingerprint {
+pub fn credential_material_schema_fingerprint(kind: CredentialKind) -> SchemaFingerprint {
     SchemaFingerprint::parse(
-        hash_bytes(format!("codextools:credential:v1:{}", kind.as_storage_str()).as_bytes())
+        hash_bytes(
+            format!(
+                "codextools:credential-material:v2:auth-document:{}",
+                kind.as_storage_str()
+            )
+            .as_bytes(),
+        )
             .as_str(),
     )
     .expect("SHA-256 is a valid schema fingerprint")
+}
+
+fn schema_fingerprint(kind: CredentialKind) -> SchemaFingerprint {
+    credential_material_schema_fingerprint(kind)
+}
+
+fn ensure_current_material_schema(
+    reference: &CredentialReference,
+) -> Result<(), CredentialServiceError> {
+    if reference.schema_fingerprint() == &schema_fingerprint(reference.kind()) {
+        Ok(())
+    } else {
+        Err(CredentialServiceError::RecoveryRequired)
+    }
+}
+
+fn api_key_auth_document(secret: &[u8]) -> Result<Zeroizing<Vec<u8>>, CredentialServiceError> {
+    validate_secret(CredentialKind::ApiKey, secret)?;
+    let mut document = Zeroizing::new(Vec::with_capacity(secret.len() + 24));
+    document.extend_from_slice(b"{\"OPENAI_API_KEY\":\"");
+    document.extend_from_slice(secret);
+    document.extend_from_slice(b"\"}\n");
+    Ok(document)
 }
 
 fn credential_fingerprint(secret: &[u8]) -> CredentialFingerprint {
@@ -1114,6 +1459,24 @@ fn validate_secret(kind: CredentialKind, secret: &[u8]) -> Result<(), Credential
     Ok(())
 }
 
+fn validate_auth_document(
+    kind: CredentialKind,
+    secret: &[u8],
+) -> Result<(), CredentialServiceError> {
+    if secret.is_empty() || secret.len() > 1024 * 1024 {
+        return Err(CredentialServiceError::InvalidSecret);
+    }
+    let config = b"model = \"gpt-SAMPLE-1\"\nmodel_provider = \"sample\"\n[model_providers.sample]\nname = \"Sample\"\nbase_url = \"https://HOST/v1\"\n";
+    match codex_adapter::CodexAdapter::new().scan_memory(config, secret) {
+        codex_application::ScanStatus::Ready(state)
+            if state.authentication.auth_mode == codex_domain::AuthMode::from(kind) =>
+        {
+            Ok(())
+        }
+        _ => Err(CredentialServiceError::InvalidSecret),
+    }
+}
+
 fn map_store_error(error: CredentialStoreError) -> CredentialServiceError {
     match error {
         CredentialStoreError::AlreadyExists => CredentialServiceError::AlreadyExists,
@@ -1131,5 +1494,42 @@ fn map_repository_error(error: RepositoryError) -> CredentialServiceError {
         RepositoryError::VersionConflict(_) => CredentialServiceError::VersionConflict,
         RepositoryError::ReferenceConflict(_) => CredentialServiceError::ReferenceConflict,
         _ => CredentialServiceError::RepositoryFailure,
+    }
+}
+
+#[cfg(test)]
+mod secret_buffer_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use codex_application::{CredentialStoreError, SecretConsumer};
+
+    use super::BufferedSecret;
+
+    #[test]
+    fn buffered_secret_zeroizes_on_consumer_error_and_unwind() {
+        let error_zeroized = Rc::new(Cell::new(false));
+        {
+            let mut buffered = BufferedSecret {
+                bytes: Vec::new(),
+                observer: Some(error_zeroized.clone()),
+            };
+            buffered.consume(b"synthetic-buffered-secret").unwrap();
+            let result: Result<(), CredentialStoreError> = Err(CredentialStoreError::IoFailure);
+            assert!(result.is_err());
+        }
+        assert!(error_zeroized.get());
+
+        let unwind_zeroized = Rc::new(Cell::new(false));
+        let observed = unwind_zeroized.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buffered = BufferedSecret {
+                bytes: Vec::new(),
+                observer: Some(observed),
+            };
+            buffered.consume(b"synthetic-unwind-secret").unwrap();
+            panic!("synthetic buffered unwind");
+        }));
+        assert!(result.is_err());
+        assert!(unwind_zeroized.get());
     }
 }

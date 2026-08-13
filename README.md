@@ -6,7 +6,44 @@ CodexTools 是面向个人开发者的本地 Codex 管理工具，聚焦运行�
 
 项目目前处于早期开发阶段，安装与使用说明将在首个可用版本发布时补充。
 
-M1 Codex 格式与路径预研已经用 PowerShell 7/.NET 零依赖探针和脱敏固定样本固化。M2.5 在 M2.2-M2.4 核心之上增加无正式 UI 的 Rust 两阶段纵向入口：`preview_from_store` 在短 owner 内生成不含正文的 approved intent并在返回前释放锁，调用方确认后由 `execute_approved` 重新取得 owner、重新读取 CurrentUser DPAPI 与 metadata、逐字段重算一致后才切换。切换事务的 auth 恢复快照同样使用绑定 root/transaction/source 证据的 CurrentUser-DPAPI envelope；普通切换与回滚的 config/auth 临时文件共用 schema v10 持久 owner 和 Windows 持续句柄原语：首个字节前记录 owner，root namespace 由无 delete-share 的目录句柄钉住，文件以 VolumeSerial/FileId128 绑定；初始 `CreateFileW` 原子携带 `FILE_FLAG_DELETE_ON_CLOSE`，durable identity 后通过同句柄和固定 root handle 的相对 hard-link 交接到规范 temp，再由同一句柄写入、校验、相对 rename 或 disposition cleanup。schema v10 是首个受支持生产格式；pre-v10/v1 内部草稿只做脱敏只读诊断并 fail closed，不自动解析、迁移或删除。short write、flush、sync、重读、rename 不确定结果与 readonly destination 均可重开收敛，未知 identity/reparse 原样保留并阻断。committed/rolled_back 后通过可重开 cleanup intent 清除全部事务材料。A/B 连续 100 次均执行 prewrite preview→批准执行→原路径重读，DPAPI 前向读取共 200 次，逐轮终态事务目录为零，随后恢复初始联合状态。正式 Tauri/React 应用、真实浏览器登录和网络请求仍未引入。
+M3.0 已建立桌面应用技术基线：Tauri 2.11.5、React 19.2.8、TypeScript 6.0.3 与 Vite 8.2.1。桌面壳层位于 `apps/desktop`，通过 Cargo workspace/path dependency 直接复用 M2 的 `codex-domain`、`codex-application`、`codex-adapter`、`local-infrastructure` 与 `windows-platform` crates，不复制核心逻辑。本阶段只有默认简体中文、可切换英文的静态就绪页。
+
+### M3.1 application facade 与 typed IPC 合同
+
+M3.1 在 `apps/desktop/src-tauri/src/application_facade` 建立纯 Rust `ApplicationFacade`，只编排 M2 已公开的错误/端口边界，不读取真实目录、凭据或网络状态。`commands.rs` 是唯一 Tauri adapter，集中注册 `describe_contract_v1` 与 `cancel_operation_v1` 两个版本化 command；`contract.rs` 的 serde DTO 使用受限 `SafeIdentifier`，复用 `codex-domain` 的高置信秘密形态检测，不接受秘密正文、路径或原始字节。`events.rs` 只定义带 `schema_version`、`operation_id`、`correlation_id` 的非敏感状态事件和可测试 `EventSink`；Accepted 事件投递失败会回滚仍处于初始可取消态的注册，使相同 operation id 可重试，若并发状态已越过回滚边界则返回 `recovery_required`。完成态提供显式释放接口，避免长生命周期 registry 无限增长。`error.rs` 将 M2 错误映射为稳定 `ErrorCode`/`ErrorEnvelope`，仅输出中文安全消息与 message key；隔离目录外写入映射为不可重试的 `compatibility_protected`。`cancellation.rs` 明确可取消检查点、M2 原子临界区的 `TooLate` 语义、重复/未知/完成后取消结果。
+
+M3.1 不引入 `@tauri-apps/api`、前端 invoke/listen、业务 UI、扫描、身份 CRUD、网络或单实例行为。Tauri capability 仍为空权限。固定 canary、危险路径、JSON roundtrip、Debug/Display/serde 与全量 M2 错误映射由 `apps/desktop/src-tauri/tests/m31_contract.rs` 覆盖；PowerShell 合同入口为 `pwsh -NoProfile -File .\tests\M31ApplicationFacade.Tests.ps1`。
+
+### M3.2 React shell、i18n 与设计系统
+
+M3.2 使用 React 19 自带的 `useReducer`/Context 建立桌面应用壳，不新增生产依赖。信息架构包含概览、状态样本和偏好设置；状态样本明确标注为本地 fixture，不代表扫描、身份管理或切换流程。集中资源表提供完整 `zh-CN` 与 `en` 文案。语言偏好具有 `system`/`zh-CN`/`en` 三态：默认 `system` 动态解析 `navigator.languages` 且不写入固定语言，只有用户明确选择后才持久化；无效存储值 fail-safe 回到 system。英文缺失键回退到简体中文，未知键回显稳定 key 便于诊断。
+
+设计系统以 CSS tokens 和复用的 Button/Card/StatusFeedback 组件覆盖颜色、排版、间距、焦点、按钮、表单、卡片及状态反馈。壳层支持正常、空、加载、错误、取消、重复操作和 `compatibility_protected` 展示；动态状态反馈固定为 `role=status`、`aria-live=polite`、`aria-atomic=true`，加载态同时使用 `aria-busy`。语言偏好存储采用窄作用域异常边界：读取失败或无效值按 system 降级并尽力清理，写入或删除失败不阻止当前会话切换，也不回显存储内容。具备语义 header/nav/aside/main、跳转主内容、键盘焦点、aria-current、全局通知 aria-live、表单标签、窄窗口、长文本、缩放溢出与 reduced-motion 基线；暗色模式使用高对比焦点 token 与双层焦点环。前端继续不使用 `@tauri-apps/api` 或 M3.1 IPC，capability permissions 保持为空。本阶段合同入口为 `pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1`。
+
+capability 仅绑定 `main` 窗口，权限数组为空；后续任何文件系统、Shell、窗口或业务命令权限都必须逐项评审。前端没有引入 `@tauri-apps/api`；M3.1 只在 Rust 侧注册两个合同 command，不发射真实业务事件。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token、API Key 或 Authorization 正文入口。
+
+### M3.0 依赖、许可证与体积评估
+
+直接新增依赖均在锁文件中精确解析：
+
+| 依赖 | 必要性 | 许可证 | 安装/构建体积影响 | 未采用的替代方案 |
+| --- | --- | --- | --- | --- |
+| `tauri` 2.11.5 / `tauri-build` 2.6.3 | 原生桌面运行时、配置与构建时代码生成 | MIT OR Apache-2.0 | Cargo 锁定包由 22 增至 430；Windows 构建会编译 WebView2/Wry 与 Tauri 传递依赖 | Electron 会捆绑 Chromium、安装与发布体积更大；Wails 需要 Go 且不能自然复用现有 Rust workspace |
+| `@tauri-apps/cli` 2.11.4 | 提供 `tauri info/build/dev` 的可复现入口，仅开发依赖 | MIT OR Apache-2.0 | npm 平台 CLI 二进制是 `node_modules` 的主要部分之一，不进入前端 bundle | 全局 CLI 会产生不可复现的版本漂移 |
+| `react` / `react-dom` 19.2.8 | 壳层组件与 DOM 渲染 | MIT | 本机安装内容约 7.5 MB；生产 bundle 经 Vite tree-shaking 压缩 | 原生 DOM 体积更小，但不符合已锁定 React 技术栈且会增加后续 UI 迁移成本 |
+| `vite` 8.2.1 / `@vitejs/plugin-react` 6.0.5 | 开发服务器、TypeScript/JSX 转换和生产构建 | MIT | 与编译器及 CLI 合计后，本机完整 `node_modules` 约 84.1 MB；仅开发时使用 | 手写 Rollup/esbuild 配置需要更多维护且偏离技术栈要求 |
+| `typescript` 6.0.3 | 严格静态类型检查 | Apache-2.0 | npm 包解压约 24.3 MB，仅开发时使用 | 7.x 是更新主版本；M3.0 选择 6.x 以降低初始 Tauri/Vite 骨架的工具链新主版本叠加风险 |
+| `@types/react` / `@types/react-dom` 19.x | React 19 TypeScript 类型 | MIT | 仅开发与类型检查使用，不进入前端 bundle | 手写声明会重复上游类型且容易漂移 |
+
+M3.1 仅将锁文件中已有的 `serde` 1.0.229（MIT OR Apache-2.0）提升为桌面 crate 的直接生产依赖，用于 typed IPC DTO；`serde_json` 1.0.151（MIT OR Apache-2.0）仅作为合同测试开发依赖。两者均已由 Tauri/M2 依赖图锁定，因此没有新增锁定包、没有前端 bundle 增量；替代的手写 JSON/序列化会重复成熟实现并削弱 schema/roundtrip 测试。
+
+本机验证工具链为 Node.js 24.14.0、npm 11.12.1、Rust/Cargo 1.97.1（MSVC）。Vite 8 要求 Node.js `^20.19.0 || >=22.12.0`；Tauri 2.11.5 与 `tauri-build` 2.6.3 的 MSRV 为 Rust 1.77.2。仓库仍声明 Rust 1.85；`cargo generate-lockfile` 已按 Rust 1.85 选择兼容传递版本，未抬高现有 crates 的 MSRV。单实例只做后续评估，本阶段未添加 single-instance plugin 或行为。
+
+M1 Codex 格式与路径预研已经用 PowerShell 7/.NET 零依赖探针和脱敏固定样本固化。M2.5 在 M2.2-M2.4 核心之上增加无正式 UI 的 Rust 两阶段纵向入口：`preview_from_store` 在短 owner 内生成不含正文的 approved intent并在返回前释放锁，调用方确认后由 `execute_approved` 重新取得 owner、重新读取 CurrentUser DPAPI 与 metadata、逐字段重算一致后才切换。切换事务的 auth 恢复快照同样使用绑定 root/transaction/source 证据的 CurrentUser-DPAPI envelope；普通切换与回滚的 config/auth 临时文件共用 schema v10 持久 owner 和 Windows 持续句柄原语：首个字节前记录 owner，root namespace 由无 delete-share 的目录句柄钉住，文件以 VolumeSerial/FileId128 绑定；初始 `CreateFileW` 原子携带 `FILE_FLAG_DELETE_ON_CLOSE`，durable identity 后通过同句柄和固定 root handle 的相对 hard-link 交接到规范 temp，再由同一句柄写入、校验、相对 rename 或 disposition cleanup。pre-v10/v1 内部草稿只做脱敏只读诊断并 fail closed，不自动解析、迁移或删除。short write、flush、sync、重读、rename 不确定结果与 readonly destination 均可重开收敛，未知 identity/reparse 原样保留并阻断。committed/rolled_back 后通过可重开 cleanup intent 清除全部事务材料。A/B 连续 100 次均执行 prewrite preview→批准执行→原路径重读，DPAPI 前向读取共 200 次，逐轮终态事务目录为零，随后恢复初始联合状态。
+
+M2.6 在不增加桌面 command/UI 的前提下补齐 Rust-only 首次导入闭环：公开边界只接受 `ControlledRoot::DefaultCodex` 与 opaque scan id。后端通过 Windows known-folder API 解析默认根，并在同一个 pinned root 下以 no-follow、禁止写/delete share 的句柄读取 config/auth；scan id 同时绑定 root/config/auth 的 VolumeSerial、FileId128、长度与内容摘要。auth parser 只借用输入，SHA-256 流式处理且所有不可避免的 owned auth buffer 在成功、错误与 unwind 路径清零。
+
+credential reference/material 仍由 `CredentialService` owner + recovery journal 单独拥有；同一跨进程 owner 覆盖 exact material/reference 验证、M2.6 phase 更新和带 version/kind/schema/fingerprint 条件的 bundle transaction commit，身份绑定完成后才释放。schema v11 的非秘密 `capture_import_operations` journal 解释 DPAPI 与 identity/preset/patch bundle 之间的中间态；预检后的 commit 竞态使用 exact reference、引用检查与 credential delete recovery 持久回滚，不以 best-effort 删除宣称原子。隔离测试覆盖 API-key/OAuth、schema tamper、reparse/file replacement、owner release、journal/metadata/bundle/CAS 故障、create/rotate/delete 竞争、两个 capture 进程，以及真实 `WindowsDpapiCredentialStore` helper 在五个持久切点被终止后的 reopen 收敛；helper 只使用自己的 synthetic root/material 并完成清理。M3.3 facade/UI 仍未实现。
 
 ## 核心方向
 
@@ -28,12 +65,24 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --all-targets
+pwsh -NoProfile -File .\tests\M30DesktopSkeleton.Tests.ps1
+pwsh -NoProfile -File .\tests\M31ApplicationFacade.Tests.ps1
+pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1
+Push-Location .\apps\desktop
+npm ci --ignore-scripts
+npm test
+npm run check
+npm run build
+npm run tauri:info
+npm run tauri:build
+Pop-Location
 pwsh -NoProfile -File .\tests\M20Workspace.Tests.ps1
 pwsh -NoProfile -File .\tests\M21IdentityCore.Tests.ps1
 pwsh -NoProfile -File .\tests\M22CodexAdapter.Tests.ps1
 pwsh -NoProfile -File .\tests\M23SwitchTransaction.Tests.ps1
 pwsh -NoProfile -File .\tests\M24CredentialBackup.Tests.ps1
 pwsh -NoProfile -File .\tests\M25VerticalClosure.Tests.ps1
+pwsh -NoProfile -File .\tests\M26CredentialCaptureImport.Tests.ps1
 ```
 
 本地协作工作树可能提供 `scripts/verify-repo.ps1` 统一入口；`scripts/` 属于 Git 忽略的本地协作资料，公开克隆不保证包含该脚本，因此不作为公开验证入口。

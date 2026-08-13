@@ -1,13 +1,38 @@
-use std::collections::BTreeMap;
-
 use codex_application::CompatibilityReason;
 
-#[derive(Debug)]
-enum JsonValue {
-    Object(BTreeMap<String, JsonValue>),
-    Array,
-    String(String),
-    Scalar,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JsonKey {
+    field: JsonField,
+    fingerprint: u64,
+    scalar_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonField {
+    ApiKey,
+    Tokens,
+    IdToken,
+    AccessToken,
+    RefreshToken,
+    AccountId,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObjectShape {
+    api_key: bool,
+    tokens: bool,
+    id_token: bool,
+    access_token: bool,
+    refresh_token: bool,
+    account_id: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Context {
+    Root,
+    Tokens,
+    Other,
 }
 
 struct Parser<'a> {
@@ -15,16 +40,17 @@ struct Parser<'a> {
     position: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn parse(mut self) -> Result<JsonValue, CompatibilityReason> {
+impl Parser<'_> {
+    fn parse(mut self) -> Result<ObjectShape, CompatibilityReason> {
         self.ws();
-        let value = self.value()?;
+        let shape = self.object(Context::Root)?;
         self.ws();
         if self.position != self.bytes.len() {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
-        Ok(value)
+        Ok(shape)
     }
+
     fn ws(&mut self) {
         while self
             .bytes
@@ -34,40 +60,52 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
     }
-    fn value(&mut self) -> Result<JsonValue, CompatibilityReason> {
-        self.ws();
-        match self.bytes.get(self.position) {
-            Some(b'{') => self.object(),
-            Some(b'[') => {
-                self.skip_array()?;
-                Ok(JsonValue::Array)
-            }
-            Some(b'"') => self.string().map(JsonValue::String),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'n') => self.literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(CompatibilityReason::UnknownAuthenticationShape),
+
+    fn object(&mut self, context: Context) -> Result<ObjectShape, CompatibilityReason> {
+        if self.bytes.get(self.position) != Some(&b'{') {
+            return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
-    }
-    fn object(&mut self) -> Result<JsonValue, CompatibilityReason> {
         self.position += 1;
         self.ws();
-        let mut values = BTreeMap::new();
+        let mut seen = Vec::<JsonKey>::new();
+        let mut shape = ObjectShape::default();
         if self.bytes.get(self.position) == Some(&b'}') {
             self.position += 1;
-            return Ok(JsonValue::Object(values));
+            return Ok(shape);
         }
         loop {
-            let key = self.string()?;
+            let key = self.key()?;
+            if seen.contains(&key) {
+                return Err(CompatibilityReason::UnknownAuthenticationShape);
+            }
+            seen.push(key);
             self.ws();
             if self.bytes.get(self.position) != Some(&b':') {
                 return Err(CompatibilityReason::UnknownAuthenticationShape);
             }
             self.position += 1;
-            let value = self.value()?;
-            if values.insert(key, value).is_some() {
-                return Err(CompatibilityReason::UnknownAuthenticationShape);
+            self.ws();
+            match (context, key.field) {
+                (Context::Root, JsonField::ApiKey) => shape.api_key = self.nonempty_string()?,
+                (Context::Root, JsonField::Tokens) => {
+                    let tokens = self.object(Context::Tokens)?;
+                    shape.tokens = true;
+                    shape.id_token = tokens.id_token;
+                    shape.access_token = tokens.access_token;
+                    shape.refresh_token = tokens.refresh_token;
+                    shape.account_id = tokens.account_id;
+                }
+                (Context::Tokens, JsonField::IdToken) => shape.id_token = self.nonempty_string()?,
+                (Context::Tokens, JsonField::AccessToken) => {
+                    shape.access_token = self.nonempty_string()?
+                }
+                (Context::Tokens, JsonField::RefreshToken) => {
+                    shape.refresh_token = self.nonempty_string()?;
+                }
+                (Context::Tokens, JsonField::AccountId) => {
+                    shape.account_id = self.nonempty_string()?
+                }
+                _ => self.value(Context::Other)?,
             }
             self.ws();
             match self.bytes.get(self.position) {
@@ -77,14 +115,28 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'}') => {
                     self.position += 1;
-                    break;
+                    return Ok(shape);
                 }
                 _ => return Err(CompatibilityReason::UnknownAuthenticationShape),
             }
         }
-        Ok(JsonValue::Object(values))
     }
-    fn skip_array(&mut self) -> Result<(), CompatibilityReason> {
+
+    fn value(&mut self, context: Context) -> Result<(), CompatibilityReason> {
+        self.ws();
+        match self.bytes.get(self.position) {
+            Some(b'{') => self.object(context).map(|_| ()),
+            Some(b'[') => self.array(),
+            Some(b'"') => self.skip_string(),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'n') => self.literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(CompatibilityReason::UnknownAuthenticationShape),
+        }
+    }
+
+    fn array(&mut self) -> Result<(), CompatibilityReason> {
         self.position += 1;
         self.ws();
         if self.bytes.get(self.position) == Some(&b']') {
@@ -92,10 +144,13 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         loop {
-            let _ = self.value()?;
+            self.value(Context::Other)?;
             self.ws();
             match self.bytes.get(self.position) {
-                Some(b',') => self.position += 1,
+                Some(b',') => {
+                    self.position += 1;
+                    self.ws();
+                }
                 Some(b']') => {
                     self.position += 1;
                     return Ok(());
@@ -104,80 +159,187 @@ impl<'a> Parser<'a> {
             }
         }
     }
-    fn string(&mut self) -> Result<String, CompatibilityReason> {
+
+    fn key(&mut self) -> Result<JsonKey, CompatibilityReason> {
+        const MAX_KEY_SCALARS: usize = 256;
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x100_0000_01b3;
         if self.bytes.get(self.position) != Some(&b'"') {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
         self.position += 1;
-        let mut result = String::new();
-        while let Some(byte) = self.bytes.get(self.position).copied() {
+        let mut fingerprint = OFFSET;
+        let mut scalar_count = 0_usize;
+        let mut candidates = [
+            (JsonField::ApiKey, "OPENAI_API_KEY".chars()),
+            (JsonField::Tokens, "tokens".chars()),
+            (JsonField::IdToken, "id_token".chars()),
+            (JsonField::AccessToken, "access_token".chars()),
+            (JsonField::RefreshToken, "refresh_token".chars()),
+            (JsonField::AccountId, "account_id".chars()),
+        ]
+        .map(|(field, expected)| (field, expected, true));
+        loop {
+            let byte = *self
+                .bytes
+                .get(self.position)
+                .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+            if byte == b'"' {
+                self.position += 1;
+                let field = candidates
+                    .into_iter()
+                    .find_map(|(field, mut expected, matches)| {
+                        (matches && expected.next().is_none()).then_some(field)
+                    })
+                    .unwrap_or(JsonField::Other);
+                return Ok(JsonKey {
+                    field,
+                    fingerprint,
+                    scalar_count,
+                });
+            }
+            let scalar = if byte == b'\\' {
+                self.position += 1;
+                self.escape_scalar()?
+            } else if byte <= 31 {
+                return Err(CompatibilityReason::UnknownAuthenticationShape);
+            } else if byte <= 127 {
+                self.position += 1;
+                char::from(byte)
+            } else {
+                let remaining = std::str::from_utf8(&self.bytes[self.position..])
+                    .map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
+                let scalar = remaining
+                    .chars()
+                    .next()
+                    .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+                self.position += scalar.len_utf8();
+                scalar
+            };
+            scalar_count = scalar_count
+                .checked_add(1)
+                .filter(|count| *count <= MAX_KEY_SCALARS)
+                .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+            fingerprint ^= u64::from(scalar as u32);
+            fingerprint = fingerprint.wrapping_mul(PRIME);
+            for (_, expected, matches) in &mut candidates {
+                *matches &= expected.next() == Some(scalar);
+            }
+        }
+    }
+
+    fn nonempty_string(&mut self) -> Result<bool, CompatibilityReason> {
+        if self.bytes.get(self.position) != Some(&b'"') {
+            return Err(CompatibilityReason::UnknownAuthenticationShape);
+        }
+        self.position += 1;
+        let mut non_whitespace = false;
+        loop {
+            let byte = *self
+                .bytes
+                .get(self.position)
+                .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
             match byte {
                 b'"' => {
                     self.position += 1;
-                    return Ok(result);
+                    return Ok(non_whitespace);
                 }
                 b'\\' => {
                     self.position += 1;
-                    let escaped = *self
-                        .bytes
-                        .get(self.position)
-                        .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
-                    self.position += 1;
-                    match escaped {
-                        b'"' => result.push('"'),
-                        b'\\' => result.push('\\'),
-                        b'/' => result.push('/'),
-                        b'b' => result.push('\u{8}'),
-                        b'f' => result.push('\u{c}'),
-                        b'n' => result.push('\n'),
-                        b'r' => result.push('\r'),
-                        b't' => result.push('\t'),
-                        b'u' => {
-                            let first = self.hex_quad()?;
-                            let scalar = if (0xd800..=0xdbff).contains(&first) {
-                                if self.bytes.get(self.position..self.position + 2) != Some(b"\\u")
-                                {
-                                    return Err(CompatibilityReason::UnknownAuthenticationShape);
-                                }
-                                self.position += 2;
-                                let second = self.hex_quad()?;
-                                if !(0xdc00..=0xdfff).contains(&second) {
-                                    return Err(CompatibilityReason::UnknownAuthenticationShape);
-                                }
-                                0x1_0000
-                                    + ((u32::from(first) - 0xd800) << 10)
-                                    + (u32::from(second) - 0xdc00)
-                            } else if (0xdc00..=0xdfff).contains(&first) {
-                                return Err(CompatibilityReason::UnknownAuthenticationShape);
-                            } else {
-                                u32::from(first)
-                            };
-                            result.push(
-                                char::from_u32(scalar)
-                                    .ok_or(CompatibilityReason::UnknownAuthenticationShape)?,
-                            );
-                        }
-                        _ => return Err(CompatibilityReason::UnknownAuthenticationShape),
+                    let scalar = self.escape_scalar()?;
+                    if !scalar.is_whitespace() {
+                        non_whitespace = true;
                     }
                 }
                 0..=31 => return Err(CompatibilityReason::UnknownAuthenticationShape),
                 32..=127 => {
-                    result.push(char::from(byte));
+                    non_whitespace |= !byte.is_ascii_whitespace();
                     self.position += 1;
                 }
                 _ => {
                     let remaining = std::str::from_utf8(&self.bytes[self.position..])
                         .map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
-                    let character = remaining
+                    let scalar = remaining
                         .chars()
                         .next()
                         .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
-                    result.push(character);
-                    self.position += character.len_utf8();
+                    non_whitespace |= !scalar.is_whitespace();
+                    self.position += scalar.len_utf8();
                 }
             }
         }
-        Err(CompatibilityReason::UnknownAuthenticationShape)
+    }
+
+    fn skip_string(&mut self) -> Result<(), CompatibilityReason> {
+        if self.bytes.get(self.position) != Some(&b'"') {
+            return Err(CompatibilityReason::UnknownAuthenticationShape);
+        }
+        self.position += 1;
+        loop {
+            let byte = *self
+                .bytes
+                .get(self.position)
+                .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    return Ok(());
+                }
+                b'\\' => {
+                    self.position += 1;
+                    let _ = self.escape_scalar()?;
+                }
+                0..=31 => return Err(CompatibilityReason::UnknownAuthenticationShape),
+                32..=127 => self.position += 1,
+                _ => {
+                    let remaining = std::str::from_utf8(&self.bytes[self.position..])
+                        .map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
+                    let scalar = remaining
+                        .chars()
+                        .next()
+                        .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+                    self.position += scalar.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn escape_scalar(&mut self) -> Result<char, CompatibilityReason> {
+        let escaped = *self
+            .bytes
+            .get(self.position)
+            .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
+        self.position += 1;
+        match escaped {
+            b'"' => Ok('"'),
+            b'\\' => Ok('\\'),
+            b'/' => Ok('/'),
+            b'b' => Ok('\u{8}'),
+            b'f' => Ok('\u{c}'),
+            b'n' => Ok('\n'),
+            b'r' => Ok('\r'),
+            b't' => Ok('\t'),
+            b'u' => {
+                let first = self.hex_quad()?;
+                let scalar = if (0xd800..=0xdbff).contains(&first) {
+                    if self.bytes.get(self.position..self.position + 2) != Some(b"\\u") {
+                        return Err(CompatibilityReason::UnknownAuthenticationShape);
+                    }
+                    self.position += 2;
+                    let second = self.hex_quad()?;
+                    if !(0xdc00..=0xdfff).contains(&second) {
+                        return Err(CompatibilityReason::UnknownAuthenticationShape);
+                    }
+                    0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00)
+                } else if (0xdc00..=0xdfff).contains(&first) {
+                    return Err(CompatibilityReason::UnknownAuthenticationShape);
+                } else {
+                    u32::from(first)
+                };
+                char::from_u32(scalar).ok_or(CompatibilityReason::UnknownAuthenticationShape)
+            }
+            _ => Err(CompatibilityReason::UnknownAuthenticationShape),
+        }
     }
 
     fn hex_quad(&mut self) -> Result<u16, CompatibilityReason> {
@@ -204,14 +366,16 @@ impl<'a> Parser<'a> {
         self.position += 4;
         Ok(value)
     }
-    fn literal(&mut self, value: &[u8]) -> Result<JsonValue, CompatibilityReason> {
+
+    fn literal(&mut self, value: &[u8]) -> Result<(), CompatibilityReason> {
         if self.bytes.get(self.position..self.position + value.len()) != Some(value) {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
         self.position += value.len();
-        Ok(JsonValue::Scalar)
+        Ok(())
     }
-    fn number(&mut self) -> Result<JsonValue, CompatibilityReason> {
+
+    fn number(&mut self) -> Result<(), CompatibilityReason> {
         if self.bytes.get(self.position) == Some(&b'-') {
             self.position += 1;
         }
@@ -277,21 +441,19 @@ impl<'a> Parser<'a> {
                 return Err(CompatibilityReason::UnknownAuthenticationShape);
             }
         }
-        Ok(JsonValue::Scalar)
+        Ok(())
     }
 }
 
 pub fn classify(bytes: &[u8]) -> Result<(&'static str, &'static str), CompatibilityReason> {
     std::str::from_utf8(bytes).map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
-    let value = Parser { bytes, position: 0 }.parse()?;
-    let JsonValue::Object(root) = value else {
-        return Err(CompatibilityReason::UnknownAuthenticationShape);
-    };
-    let api = matches!(root.get("OPENAI_API_KEY"), Some(JsonValue::String(value)) if !value.trim().is_empty());
-    let oauth = match root.get("tokens") {
-        Some(JsonValue::Object(tokens)) => ["id_token","access_token","refresh_token","account_id"].iter().all(|key| matches!(tokens.get(*key), Some(JsonValue::String(value)) if !value.trim().is_empty())),
-        _ => false,
-    };
+    let shape = Parser { bytes, position: 0 }.parse()?;
+    let api = shape.api_key;
+    let oauth = shape.tokens
+        && shape.id_token
+        && shape.access_token
+        && shape.refresh_token
+        && shape.account_id;
     match (api, oauth) {
         (true, false) => Ok(("api_key", "OPENAI_API_KEY:string")),
         (false, true) => Ok((

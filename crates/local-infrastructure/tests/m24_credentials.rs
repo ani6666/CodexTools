@@ -93,6 +93,13 @@ fn runtime_secret() -> Vec<u8> {
     value
 }
 
+fn api_key_document(secret: &[u8]) -> Vec<u8> {
+    let mut document = Vec::from(&b"{\"OPENAI_API_KEY\":\""[..]);
+    document.extend_from_slice(secret);
+    document.extend_from_slice(b"\"}\n");
+    document
+}
+
 struct PausingReadStore {
     inner: WindowsDpapiCredentialStore,
     entered: Arc<Barrier>,
@@ -1088,7 +1095,7 @@ fn api_key_create_rotate_read_delete_and_reference_boundary() {
     let second = {
         let mut service = CredentialService::new(&mut repository, &mut store);
         let mut first_secret = runtime_secret();
-        let first_hash = hash_bytes(&first_secret);
+        let first_hash = hash_bytes(&api_key_document(&first_secret));
         let first = service
             .create_api_key(id.clone(), &mut first_secret, UnixMillis::new(10).unwrap())
             .unwrap();
@@ -1100,7 +1107,7 @@ fn api_key_create_rotate_read_delete_and_reference_boundary() {
         assert_eq!(consumer.hash, Some(first_hash));
         let mut second_secret = runtime_secret();
         second_secret.push(b'2');
-        let second_hash = hash_bytes(&second_secret);
+        let second_hash = hash_bytes(&api_key_document(&second_secret));
         let second = service
             .rotate_credential(
                 &id,

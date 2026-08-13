@@ -70,9 +70,14 @@ if ($LASTEXITCODE -eq 0) {
     $rusqlite = $infrastructurePackage.dependencies | Where-Object name -EQ 'rusqlite' | Select-Object -First 1
     Assert-True ($rusqlite.req -eq '=0.37.0') 'rusqlite 精确锁定 0.37.0'
     Assert-True (@($rusqlite.features) -contains 'bundled') 'rusqlite 启用 bundled feature'
-    $binaryTargets = @($metadata.packages.targets | Where-Object kind -Contains 'bin')
-    $allowedInternalBins = @('m23-lock-probe', 'm23-sensitive-temp-crash', 'm24-oauth-helper')
-    Assert-True (($binaryTargets | Where-Object name -NotIn $allowedInternalBins).Count -eq 0) '不引入 UI 或面向用户的可执行程序入口；仅允许阶段内部测试探针'
+    $binaryTargets = @(
+        $metadata.packages |
+            Where-Object name -NE 'codextools-desktop' |
+            ForEach-Object targets |
+            Where-Object kind -Contains 'bin'
+    )
+    $allowedInternalBins = @('m23-lock-probe', 'm23-sensitive-temp-crash', 'm24-oauth-helper', 'm26-capture-import-crash')
+    Assert-True (($binaryTargets | Where-Object name -NotIn $allowedInternalBins).Count -eq 0) 'M2 后端不引入 UI 或面向用户的可执行程序入口；仅允许阶段内部测试探针'
 }
 
 $allManifests = @(
