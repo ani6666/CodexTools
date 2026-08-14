@@ -3,7 +3,7 @@
 use std::{
     cell::Cell,
     fs,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Barrier},
@@ -2424,7 +2424,8 @@ fn second_process_observes_lock_contended() {
     let binary = env!("CARGO_BIN_EXE_m23-lock-probe");
     let mut first = Command::new(binary)
         .arg(&root.root)
-        .arg("700")
+        .arg("stdin")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -2442,6 +2443,7 @@ fn second_process_observes_lock_contended() {
         String::from_utf8(second.stdout).unwrap().trim(),
         "LOCK_CONTENDED"
     );
+    first.stdin.take().unwrap().write_all(b"release\n").unwrap();
     assert!(first.wait().unwrap().success());
     let LockDiagnostic::Owner(owner) = CrossProcessWriteLock::read_diagnostic(&root.root) else {
         panic!()

@@ -94,31 +94,31 @@ fn read_stable_path(
     consumer: &mut dyn StableSnapshotConsumer,
 ) -> Result<(), ControlledSourceError> {
     let initial_root = RootNamespacePin::acquire(path).map_err(|error| map_read_error(&error))?;
-    let canonical_root = initial_root.final_path().to_path_buf();
-    drop(initial_root);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .and_then(|value| UnixMillis::new(value).ok())
         .ok_or(ControlledSourceError::IoUnavailable)?;
-    let _lock = crate::CrossProcessWriteLock::try_acquire(&canonical_root, now).map_err(
-        |error| match error {
-            codex_application::SwitchExecutionError::Busy => ControlledSourceError::Busy,
-            _ => ControlledSourceError::IoUnavailable,
-        },
-    )?;
-    let root = RootNamespacePin::acquire_canonical(&canonical_root)
-        .map_err(|error| map_read_error(&error))?;
+    let lock =
+        crate::CrossProcessWriteLock::try_acquire_pinned(initial_root, now).map_err(|error| {
+            match error {
+                codex_application::SwitchExecutionError::Busy => ControlledSourceError::Busy,
+                _ => ControlledSourceError::IoUnavailable,
+            }
+        })?;
+    let root = lock
+        .root_pin()
+        .map_err(|_| ControlledSourceError::IoUnavailable)?;
     if !root
         .relative_directory_is_empty(".codextools-transactions")
         .map_err(|error| map_read_error(&error))?
     {
         return Err(ControlledSourceError::RecoveryRequired);
     }
-    let mut config = PinnedLiveFile::open_stable_read(&root, "config.toml")
+    let mut config = PinnedLiveFile::open_stable_read(root, "config.toml")
         .map_err(|error| map_read_error(&error))?;
-    let mut auth = PinnedLiveFile::open_stable_read(&root, "auth.json")
+    let mut auth = PinnedLiveFile::open_stable_read(root, "auth.json")
         .map_err(|error| map_read_error(&error))?;
     let config_length = config.length().map_err(|error| map_read_error(&error))?;
     let auth_length = auth.length().map_err(|error| map_read_error(&error))?;
@@ -131,9 +131,9 @@ fn read_stable_path(
     root.verify_identity()
         .map_err(|error| map_read_error(&error))?;
     config
-        .verify_identity(&root)
+        .verify_identity(root)
         .map_err(|error| map_read_error(&error))?;
-    auth.verify_identity(&root)
+    auth.verify_identity(root)
         .map_err(|error| map_read_error(&error))?;
     if config.length().map_err(|error| map_read_error(&error))? != config_length
         || auth.length().map_err(|error| map_read_error(&error))? != auth_length
@@ -211,8 +211,7 @@ mod tests {
                 bytes: Zeroizing::new(b"synthetic-owned-auth".to_vec()),
                 zeroized: rejected.clone(),
             };
-            let result =
-                RejectingConsumer.consume(&mut [], &mut secret.bytes, b"evidence");
+            let result = RejectingConsumer.consume(&mut [], &mut secret.bytes, b"evidence");
             assert_eq!(result, Err(ControlledSourceError::ConsumerRejected));
         }
         assert!(rejected.get());
@@ -235,9 +234,7 @@ mod tests {
         let rejected = Rc::new(Cell::new(false));
         {
             let mut config = ObservedBuffer {
-                bytes: Zeroizing::new(
-                    b"unknown = \"-----BEGIN PRIVATE KEY-----\"".to_vec(),
-                ),
+                bytes: Zeroizing::new(b"unknown = \"-----BEGIN PRIVATE KEY-----\"".to_vec()),
                 zeroized: rejected.clone(),
             };
             let mut auth = b"{}".to_vec();

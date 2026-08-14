@@ -52,6 +52,14 @@ fn request(
     source: &impl ControlledCodexSource,
     offset: u8,
 ) -> Result<CaptureImportRequest, &'static str> {
+    request_with_credential_offset(source, offset, offset)
+}
+
+fn request_with_credential_offset(
+    source: &impl ControlledCodexSource,
+    offset: u8,
+    credential_offset: u8,
+) -> Result<CaptureImportRequest, &'static str> {
     let ControlledScanStatus::Ready(summary) = source.scan(ControlledRoot::DefaultCodex) else {
         return Err("synthetic root did not scan");
     };
@@ -59,7 +67,10 @@ fn request(
     Ok(CaptureImportRequest {
         root: ControlledRoot::DefaultCodex,
         scan_id: summary.scan_id,
-        credential_id: CredentialRefId::parse(&id(0x11)).map_err(|_| "credential id")?,
+        credential_id: CredentialRefId::parse(&format!(
+            "11{credential_offset:02x}0000-0000-4000-8000-000000000001"
+        ))
+        .map_err(|_| "credential id")?,
         identity_id: IdentityId::parse(&id(0x22)).map_err(|_| "identity id")?,
         identity_name: EntityName::parse("隔离身份").map_err(|_| "identity name")?,
         preset_id: ModelPresetId::parse(&id(0x33)).map_err(|_| "preset id")?,
@@ -199,6 +210,12 @@ fn run_import(arguments: &[String]) -> i32 {
     let Ok(request) = request(&source, offset) else {
         return 65;
     };
+    println!("IMPORT_READY");
+    io::stdout().flush().expect("flush import ready");
+    let mut release = String::new();
+    io::stdin()
+        .read_line(&mut release)
+        .expect("import release signal");
     let mut repository = match SqliteMetadataRepository::open(database) {
         Ok(repository) => repository,
         Err(_) => return 66,
@@ -232,12 +249,71 @@ fn run_import(arguments: &[String]) -> i32 {
     }
 }
 
+fn run_import_shared_credential(arguments: &[String]) -> i32 {
+    if arguments.len() != 6 {
+        return 64;
+    }
+    let controlled_root = PathBuf::from(&arguments[1]);
+    let database = PathBuf::from(&arguments[2]);
+    let credential_root = PathBuf::from(&arguments[3]);
+    let Ok(offset) = arguments[4].parse::<u8>() else {
+        return 64;
+    };
+    let Ok(credential_offset) = arguments[5].parse::<u8>() else {
+        return 64;
+    };
+    let source = ControlledCodexAdapter::new(WindowsControlledRootReader::new(SyntheticResolver(
+        controlled_root,
+    )));
+    let Ok(request) = request_with_credential_offset(&source, offset, credential_offset) else {
+        return 65;
+    };
+    let mut repository = match SqliteMetadataRepository::open(database) {
+        Ok(repository) => repository,
+        Err(_) => return 66,
+    };
+    let mut store = match WindowsDpapiCredentialStore::new(credential_root) {
+        Ok(store) => store,
+        Err(_) => return 67,
+    };
+    println!("OWNER_CAS_READY");
+    io::stdout().flush().expect("flush owner/CAS ready");
+    let mut release = String::new();
+    io::stdin()
+        .read_line(&mut release)
+        .expect("owner/CAS release signal");
+    match CaptureImportService::new().capture_import(&source, &mut repository, &mut store, request)
+    {
+        CaptureImportStatus::Imported(_) => {
+            println!("IMPORT_IMPORTED");
+            0
+        }
+        CaptureImportStatus::AlreadyImported(_) => {
+            println!("IMPORT_ALREADY_IMPORTED");
+            0
+        }
+        CaptureImportStatus::Conflict => {
+            println!("IMPORT_CONFLICT");
+            2
+        }
+        CaptureImportStatus::RecoveryRequired(diagnostic) => {
+            println!("IMPORT_RECOVERY_REQUIRED {diagnostic:?}");
+            3
+        }
+        CaptureImportStatus::CompatibilityProtected(reason) => {
+            println!("IMPORT_COMPATIBILITY_PROTECTED {reason:?}");
+            4
+        }
+    }
+}
+
 fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let code = match arguments.first().map(String::as_str) {
         Some("crash") => run_crash(&arguments),
         Some("contend") => run_contender(&arguments),
         Some("import") => run_import(&arguments),
+        Some("import-shared-credential") => run_import_shared_credential(&arguments),
         _ => 64,
     };
     let _ = hash_bytes(b"synthetic helper linkage");

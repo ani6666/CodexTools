@@ -25,7 +25,10 @@ use codex_domain::{
     CredentialKind, CredentialRefId, EndpointUrl, EntityName, EntityVersion, IdentityId,
     ProviderId, RuntimeIdentity, SchemaFingerprint, UnixMillis,
 };
-use local_infrastructure::{CredentialService, CredentialServiceError, SqliteMetadataRepository};
+use local_infrastructure::{
+    CredentialService, CredentialServiceError, SqliteMetadataRepository,
+    credential_material_schema_fingerprint,
+};
 use windows_platform::WindowsDpapiCredentialStore;
 
 #[cfg(windows)]
@@ -2207,6 +2210,110 @@ fn credential_recovery_api_adopts_rolls_back_and_cleans_up_idempotently() {
     println!(
         "M24_CREDENTIAL_RECOVERY rotate_rollback=idempotent rotate_metadata_committed_clear_failed=reopen_retry_cleared delete_adopt=metadata_restored delete_cleanup=material_removed diagnostics=cleared"
     );
+}
+
+#[test]
+fn destructive_create_recovery_preserves_replaced_same_binding_material_after_reopen() {
+    for (index, cleanup) in [false, true].into_iter().enumerate() {
+        let area = TempArea::new("recovery-replaced-material");
+        let database = area.root.join("metadata.sqlite3");
+        let credential_root = area.root.join("credentials");
+        let id_text = format!("3{index}303030-3030-4030-8030-303030303030");
+        let recovery = prepare_create_terminal_recovery(&database, &credential_root, &id_text);
+        let binding = CredentialEnvelopeBinding::new(
+            recovery.credential_id.clone(),
+            recovery.kind,
+            credential_material_schema_fingerprint(recovery.kind),
+            recovery.generation,
+        );
+        let mut replacement = runtime_secret();
+        replacement.push(b'X' + u8::try_from(index).unwrap());
+        let replacement_hash = hash_bytes(&replacement);
+
+        {
+            let mut store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+            store.delete(&binding).unwrap();
+            store.create(&binding, &mut replacement).unwrap();
+        }
+        assert!(replacement.iter().all(|byte| *byte == 0));
+
+        let mut repository = SqliteMetadataRepository::open(&database).unwrap();
+        let mut store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+        let result = if cleanup {
+            CredentialService::new(&mut repository, &mut store)
+                .cleanup_recovery(&recovery.operation_id)
+        } else {
+            CredentialService::new(&mut repository, &mut store)
+                .rollback_recovery(&recovery.operation_id, UnixMillis::new(31).unwrap())
+        };
+        assert_eq!(result, Err(CredentialServiceError::RecoveryRequired));
+        assert!(
+            repository
+                .get_credential_recovery(&recovery.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        let mut consumer = HashConsumer {
+            hash: None,
+            length: 0,
+        };
+        store.read(&binding, &mut consumer).unwrap();
+        assert_eq!(consumer.hash, Some(replacement_hash));
+    }
+}
+
+#[test]
+fn destructive_create_recovery_requires_exact_material_reference_and_hash() {
+    for (index, column) in ["material_ref", "material_sha256"].into_iter().enumerate() {
+        let area = TempArea::new("recovery-stale-evidence");
+        let database = area.root.join("metadata.sqlite3");
+        let credential_root = area.root.join("credentials");
+        let id_text = format!("4{index}404040-4040-4040-8040-404040404040");
+        let recovery = prepare_create_terminal_recovery(&database, &credential_root, &id_text);
+        let binding = CredentialEnvelopeBinding::new(
+            recovery.credential_id.clone(),
+            recovery.kind,
+            credential_material_schema_fingerprint(recovery.kind),
+            recovery.generation,
+        );
+        let original = {
+            let store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+            store.inspect(&binding).unwrap()
+        };
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        match column {
+            "material_ref" => connection
+                .execute(
+                    "UPDATE credential_recovery_operations SET material_ref='stale/generation-1.dpapi' WHERE operation_id=?1",
+                    [&recovery.operation_id],
+                )
+                .unwrap(),
+            "material_sha256" => connection
+                .execute(
+                    "UPDATE credential_recovery_operations SET material_sha256=?2 WHERE operation_id=?1",
+                    (&recovery.operation_id, "0".repeat(64)),
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        drop(connection);
+
+        let mut repository = SqliteMetadataRepository::open(&database).unwrap();
+        let mut store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+        assert_eq!(
+            CredentialService::new(&mut repository, &mut store)
+                .cleanup_recovery(&recovery.operation_id),
+            Err(CredentialServiceError::RecoveryRequired),
+            "stale {column} must not authorize deletion"
+        );
+        assert_eq!(store.inspect(&binding).unwrap(), original);
+        assert!(
+            repository
+                .get_credential_recovery(&recovery.operation_id)
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[test]

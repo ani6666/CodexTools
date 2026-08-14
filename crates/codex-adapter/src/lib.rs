@@ -124,7 +124,7 @@ fn scan_slices(config: &[u8], auth: &[u8]) -> ScanStatus {
     };
     ScanStatus::Ready(Box::new(ActualCodexState {
         config: ScannedConfig {
-            original_bytes: config.to_vec(),
+            original_bytes: Zeroizing::new(config.to_vec()),
             baseline_sha256: hash_bytes(config),
             has_bom: parsed.has_bom,
             line_ending: parsed.line_ending,
@@ -374,10 +374,10 @@ impl ConfigPlanner for CodexAdapter {
                 .ok_or(CompatibilityReason::MissingManagedField)?
                 .value
                 .clone();
-            if before != *after {
+            if before.as_str() != after {
                 changes.push(ManagedFieldChange {
                     path: path.clone(),
-                    before,
+                    before: before.as_str().to_owned(),
                     after: after.clone(),
                 })
             }

@@ -223,13 +223,12 @@ fn credential_from_state(
             AuthMode::OAuth => CredentialKind::OAuthBundle,
         },
         CredentialBackend::WindowsDpapiCurrentUser,
-        local_infrastructure::credential_material_schema_fingerprint(match actual
-            .authentication
-            .auth_mode
-        {
-            AuthMode::ApiKey => CredentialKind::ApiKey,
-            AuthMode::OAuth => CredentialKind::OAuthBundle,
-        }),
+        local_infrastructure::credential_material_schema_fingerprint(
+            match actual.authentication.auth_mode {
+                AuthMode::ApiKey => CredentialKind::ApiKey,
+                AuthMode::OAuth => CredentialKind::OAuthBundle,
+            },
+        ),
         actual.authentication.credential_fingerprint.clone(),
         UnixMillis::new(now).unwrap(),
     )

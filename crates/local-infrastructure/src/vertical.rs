@@ -279,7 +279,7 @@ impl VerticalSwitchPlanner {
             credential_fingerprint_prefix: short_hash(credential.credential_fingerprint().as_str()),
             diff: planned.diff.lines().to_vec(),
         };
-        let plan = SwitchPlan::new(
+        let plan = SwitchPlan::new_zeroizing(
             transaction_id,
             root,
             FileBaseline::present(
@@ -293,7 +293,7 @@ impl VerticalSwitchPlanner {
                 auth_source_hash,
             ),
             planned.target_bytes,
-            target_auth.to_vec(),
+            Zeroizing::new(target_auth.to_vec()),
             identity.provider_id().clone(),
             preset.model_id().clone(),
             target.authentication.credential_fingerprint.clone(),
@@ -420,10 +420,12 @@ impl VerticalSwitchPlanner {
     ) -> Result<PreparedVerticalSwitch, VerticalClosureError> {
         let root = fs::canonicalize(root).map_err(|_| VerticalClosureError::IoFailure)?;
         ensure_identity_bundle(identity, preset, credential)?;
-        let config = target
-            .config
-            .take()
-            .ok_or(VerticalClosureError::InvalidTarget)?;
+        let config = Zeroizing::new(
+            target
+                .config
+                .take()
+                .ok_or(VerticalClosureError::InvalidTarget)?,
+        );
         let auth = Zeroizing::new(
             target
                 .auth
@@ -458,7 +460,7 @@ impl VerticalSwitchPlanner {
             credential_fingerprint_prefix: short_hash(credential.credential_fingerprint().as_str()),
             diff: vec!["config/authentication: restore bound joint snapshot [REDACTED]".to_owned()],
         };
-        let plan = SwitchPlan::new_zeroizing_auth(
+        let plan = SwitchPlan::new_zeroizing(
             transaction_id,
             root,
             target.config_source.clone(),

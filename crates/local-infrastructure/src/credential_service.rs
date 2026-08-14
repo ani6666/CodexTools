@@ -159,12 +159,7 @@ where
             CaptureImportCredentialOrigin,
             &CredentialReference,
         ) -> Result<P, E>,
-        Operation: FnOnce(
-            &mut R,
-            &mut S,
-            &CredentialReference,
-            P,
-        ) -> Result<T, E>,
+        Operation: FnOnce(&mut R, &mut S, &CredentialReference, P) -> Result<T, E>,
     {
         let owner = match self.store.begin_mutation(&id) {
             Ok(owner) => owner,
@@ -211,12 +206,7 @@ where
             CaptureImportCredentialOrigin,
             &CredentialReference,
         ) -> Result<P, E>,
-        Operation: FnOnce(
-            &mut R,
-            &mut S,
-            &CredentialReference,
-            P,
-        ) -> Result<T, E>,
+        Operation: FnOnce(&mut R, &mut S, &CredentialReference, P) -> Result<T, E>,
     {
         let result = (|| {
             let planned = self
@@ -357,10 +347,8 @@ where
             credential_fingerprint(secret),
             now,
         );
-        let reference = self.reference_with_recovery_timestamps(
-            reference,
-            CredentialRecoveryOperation::Create,
-        )?;
+        let reference = self
+            .reference_with_recovery_timestamps(reference, CredentialRecoveryOperation::Create)?;
         if let Some(existing) = self
             .repository
             .get_credential_reference(reference.id())
@@ -369,8 +357,7 @@ where
             if !same_reference_material(&existing, &reference) {
                 return Err(CredentialServiceError::AlreadyExists);
             }
-            if self.material_fingerprint(&binding(&existing))?
-                != *existing.credential_fingerprint()
+            if self.material_fingerprint(&binding(&existing))? != *existing.credential_fingerprint()
             {
                 return Err(CredentialServiceError::RecoveryRequired);
             }
@@ -904,6 +891,9 @@ where
                 {
                     return Err(CredentialServiceError::RecoveryRequired);
                 }
+                if !self.verify_destructive_recovery_material(&recovery, &binding)? {
+                    return self.clear_recovery(recovery);
+                }
                 match self.store.delete(&binding) {
                     Ok(()) | Err(CredentialStoreError::NotFound) => {}
                     Err(error) => return Err(map_store_error(error)),
@@ -1013,6 +1003,9 @@ where
                     }
                     return self.clear_recovery(recovery);
                 }
+                if !self.verify_destructive_recovery_material(&recovery, &binding)? {
+                    return self.clear_recovery(recovery);
+                }
                 match self.store.delete(&binding) {
                     Ok(()) | Err(CredentialStoreError::NotFound) => {}
                     Err(error) => return Err(map_store_error(error)),
@@ -1033,6 +1026,59 @@ where
         consumer
             .fingerprint
             .ok_or(CredentialServiceError::RecoveryRequired)
+    }
+
+    fn verify_destructive_recovery_material(
+        &mut self,
+        recovery: &CredentialRecoveryRecord,
+        binding: &CredentialEnvelopeBinding,
+    ) -> Result<bool, CredentialServiceError> {
+        let planned_ref = self
+            .store
+            .planned_material_ref(binding)
+            .map_err(map_store_error)?;
+        if planned_ref != recovery.material_ref {
+            return Err(CredentialServiceError::RecoveryRequired);
+        }
+        let expected_hash = recovery
+            .material_hash
+            .as_ref()
+            .ok_or(CredentialServiceError::RecoveryRequired)?;
+        let expected_fingerprint = recovery
+            .planned_credential_fingerprint
+            .as_ref()
+            .ok_or(CredentialServiceError::RecoveryRequired)?;
+        let (diagnostic, restore_delete_recovery) = match recovery.operation {
+            CredentialRecoveryOperation::Delete => {
+                match self.store.inspect_delete_recovery(binding) {
+                    Ok(value) => (Ok(value), true),
+                    Err(CredentialStoreError::RecoveryRequired) => {
+                        (self.store.inspect(binding), false)
+                    }
+                    Err(error) => (Err(error), false),
+                }
+            }
+            CredentialRecoveryOperation::Create | CredentialRecoveryOperation::Rotate => {
+                (self.store.inspect(binding), false)
+            }
+        };
+        let diagnostic = match diagnostic {
+            Ok(value) => value,
+            Err(CredentialStoreError::NotFound) => return Ok(false),
+            Err(error) => return Err(map_store_error(error)),
+        };
+        if diagnostic.material_ref != planned_ref || &diagnostic.material_hash != expected_hash {
+            return Err(CredentialServiceError::RecoveryRequired);
+        }
+        if restore_delete_recovery {
+            self.store
+                .restore_delete_recovery(binding)
+                .map_err(map_store_error)?;
+        }
+        if &self.material_fingerprint(binding)? != expected_fingerprint {
+            return Err(CredentialServiceError::RecoveryRequired);
+        }
+        Ok(true)
     }
 
     fn ensure_recovery(
@@ -1389,7 +1435,7 @@ pub fn credential_material_schema_fingerprint(kind: CredentialKind) -> SchemaFin
             )
             .as_bytes(),
         )
-            .as_str(),
+        .as_str(),
     )
     .expect("SHA-256 is a valid schema fingerprint")
 }

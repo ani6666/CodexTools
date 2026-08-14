@@ -12,6 +12,7 @@ use codex_application::{
     ScannedConfig, SecretConsumer, build_scanned_identity_bundle,
 };
 use codex_domain::{AuthMode, CredentialKind, CredentialReference, EntityVersion, IdentityId};
+use zeroize::Zeroizing;
 
 use crate::{CredentialService, CredentialServiceError, ScopedCredentialError};
 
@@ -162,11 +163,13 @@ impl CaptureImportService {
                             codex_application::CompatibilityReason::IoUnavailable,
                         )
                     }
-                    Err(ControlledSourceError::ConsumerRejected) => consumer
-                        .result
-                        .unwrap_or(CaptureImportStatus::RecoveryRequired(
-                            CaptureImportDiagnostic::InconsistentState,
-                        )),
+                    Err(ControlledSourceError::ConsumerRejected) => {
+                        consumer
+                            .result
+                            .unwrap_or(CaptureImportStatus::RecoveryRequired(
+                                CaptureImportDiagnostic::InconsistentState,
+                            ))
+                    }
                     Err(ControlledSourceError::RecoveryRequired) => {
                         CaptureImportStatus::RecoveryRequired(
                             CaptureImportDiagnostic::InconsistentState,
@@ -183,9 +186,9 @@ impl CaptureImportService {
                 | CredentialServiceError::VersionConflict
                 | CredentialServiceError::InvalidSecret,
             )) => CaptureImportStatus::Conflict,
-            Err(ScopedCredentialError::Credential(_)) => CaptureImportStatus::RecoveryRequired(
-                CaptureImportDiagnostic::CredentialPending,
-            ),
+            Err(ScopedCredentialError::Credential(_)) => {
+                CaptureImportStatus::RecoveryRequired(CaptureImportDiagnostic::CredentialPending)
+            }
         }
     }
 
@@ -382,17 +385,20 @@ where
                         Some(_) => return Err(CaptureImportStatus::Conflict),
                         None => match repository.create_capture_import_recovery(&record) {
                             Ok(()) => record,
-                            Err(RepositoryError::AlreadyExists(_)) => match repository
-                                .get_capture_import_recovery(&self.operation_id)
-                            {
-                                Ok(Some(existing))
-                                    if record_matches_request(&existing, &self.request)
-                                        && record_matches_actual(&existing, actual)
-                                        && record_matches_credential(
-                                            &existing, origin, credential,
-                                        ) => existing,
-                                _ => return Err(CaptureImportStatus::Conflict),
-                            },
+                            Err(RepositoryError::AlreadyExists(_)) => {
+                                match repository.get_capture_import_recovery(&self.operation_id) {
+                                    Ok(Some(existing))
+                                        if record_matches_request(&existing, &self.request)
+                                            && record_matches_actual(&existing, actual)
+                                            && record_matches_credential(
+                                                &existing, origin, credential,
+                                            ) =>
+                                    {
+                                        existing
+                                    }
+                                    _ => return Err(CaptureImportStatus::Conflict),
+                                }
+                            }
                             Err(_) => {
                                 return Err(CaptureImportStatus::RecoveryRequired(
                                     CaptureImportDiagnostic::JournalUnavailable,
@@ -767,7 +773,7 @@ fn expected_bundle(
 ) -> Result<IdentityBundle, ()> {
     let actual = ActualCodexState {
         config: ScannedConfig {
-            original_bytes: Vec::new(),
+            original_bytes: Zeroizing::new(Vec::new()),
             baseline_sha256: record.config_hash.clone(),
             has_bom: false,
             line_ending: codex_application::LineEnding::None,

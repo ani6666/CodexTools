@@ -135,7 +135,7 @@ fn planning_is_deterministic_and_preserves_unknown_bytes() {
             "base_url = \"https://TARGET/v2\"",
             1,
         );
-    assert_eq!(first.target_bytes, expected.as_bytes());
+    assert_eq!(first.target_bytes.as_slice(), expected.as_bytes());
     assert!(expected.contains("unknown_future_key = \"KEEP_ME\""));
     assert!(expected.contains("unknown_provider_option = true"));
     assert!(expected.contains("# 保留行尾注释"));
@@ -312,9 +312,7 @@ fn auth_json_rejects_unicode_escape_equivalent_duplicate_keys() {
         home.write(&config, auth);
         assert!(matches!(
             adapter.scan_explicit_root(home.path()),
-            ScanStatus::CompatibilityProtected(
-                CompatibilityReason::UnknownAuthenticationShape
-            )
+            ScanStatus::CompatibilityProtected(CompatibilityReason::UnknownAuthenticationShape)
         ));
     }
 }
@@ -372,7 +370,7 @@ fn cross_provider_planning_requires_predeclared_table_and_preserves_both_tables(
     let plan_b = adapter
         .plan_config(&state_a, &desired_b, &credential)
         .unwrap();
-    let target_b = String::from_utf8(plan_b.target_bytes.clone()).unwrap();
+    let target_b = String::from_utf8(plan_b.target_bytes.to_vec()).unwrap();
     assert!(target_b.contains("unknown_a = \"KEEP_A\""));
     assert!(target_b.contains("unknown_b = \"KEEP_B\""));
     roundtrip.write(&plan_b.target_bytes, auth);
@@ -386,10 +384,60 @@ fn cross_provider_planning_requires_predeclared_table_and_preserves_both_tables(
     let plan_a = adapter
         .plan_config(&state_b, &desired_a, &credential)
         .unwrap();
-    let target_a = String::from_utf8(plan_a.target_bytes).unwrap();
+    let target_a = String::from_utf8(plan_a.target_bytes.to_vec()).unwrap();
     assert!(target_a.contains("unknown_a = \"KEEP_A\""));
     assert!(target_a.contains("unknown_b = \"KEEP_B\""));
     assert!(target_a.contains("model_provider = \"a\""));
     assert!(target_a.contains("model = \"model-a\""));
+}
+
+#[test]
+fn scanned_config_debug_never_formats_owned_config_bytes() {
+    let adapter = CodexAdapter::new();
+    let canary = "CONFIG_CANARY_VALUE_ABC123";
+    let config = format!(
+        "model = \"gpt-SAMPLE\"\n\
+         model_provider = \"sample\"\n\
+         [model_providers.sample]\n\
+         name = \"Sample Provider\"\n\
+         base_url = \"https://HOST/v1\"\n\
+         unknown_future_key = \"{canary}\"\n"
+    );
+    let actual = ready(adapter.scan_memory(config.as_bytes(), br#"{"OPENAI_API_KEY":"TOKEN"}"#));
+
+    let debug = format!("{actual:?}");
+    assert!(!debug.contains(canary));
+    assert!(!debug.contains("original_bytes"));
+    assert!(!debug.contains(&format!("{:?}", config.as_bytes())));
+    assert!(debug.contains("[REDACTED_CONFIG_BYTES]"));
+}
+
+#[test]
+fn scanned_config_unwind_exposes_only_a_synthetic_panic_payload() {
+    let adapter = CodexAdapter::new();
+    let canary = "CONFIG_UNWIND_CANARY_456XYZ";
+    let config = format!(
+        "model = \"gpt-SAMPLE\"\n\
+         model_provider = \"sample\"\n\
+         [model_providers.sample]\n\
+         name = \"Sample Provider\"\n\
+         base_url = \"https://HOST/v1\"\n\
+         unknown_future_key = \"{canary}\"\n"
+    );
+    let panic = std::panic::catch_unwind(|| {
+        let actual =
+            ready(adapter.scan_memory(config.as_bytes(), br#"{"OPENAI_API_KEY":"TOKEN"}"#));
+        assert!(!format!("{actual:?}").contains(canary));
+        panic!("synthetic config unwind");
+    });
+
+    let payload = panic.unwrap_err();
+    let payload = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or_default();
+    assert_eq!(payload, "synthetic config unwind");
+    assert!(!payload.contains(canary));
 }
 use zeroize as _;

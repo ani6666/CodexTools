@@ -4,7 +4,7 @@ use std::{
     cell::Cell,
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -81,6 +81,18 @@ impl ControlledRootResolver for SyntheticResolver {
 
 struct StableProbeConsumer {
     operation: Box<dyn FnOnce()>,
+}
+
+struct ExpectedSecretHash {
+    expected: codex_domain::ContentHash,
+    matched: bool,
+}
+
+impl SecretConsumer for ExpectedSecretHash {
+    fn consume(&mut self, secret: &[u8]) -> Result<(), CredentialStoreError> {
+        self.matched = hash_bytes(secret) == self.expected;
+        Ok(())
+    }
 }
 
 impl codex_adapter::StableSnapshotConsumer for StableProbeConsumer {
@@ -485,6 +497,20 @@ fn cleanup_dpapi_import(
     credential_root: &PathBuf,
     request: &CaptureImportRequest,
 ) {
+    cleanup_identity_metadata(database, request);
+    let mut repository = SqliteMetadataRepository::open(database).unwrap();
+    if let Some(reference) = repository
+        .get_credential_reference(&request.credential_id)
+        .unwrap()
+    {
+        let mut store = WindowsDpapiCredentialStore::new(credential_root).unwrap();
+        CredentialService::new(&mut repository, &mut store)
+            .delete_credential(reference.id(), reference.version())
+            .unwrap();
+    }
+}
+
+fn cleanup_identity_metadata(database: &PathBuf, request: &CaptureImportRequest) {
     let connection = rusqlite::Connection::open(database).unwrap();
     connection
         .execute(
@@ -512,17 +538,6 @@ fn cleanup_dpapi_import(
             [request.identity_id.as_str()],
         )
         .unwrap();
-    drop(connection);
-    let mut repository = SqliteMetadataRepository::open(database).unwrap();
-    if let Some(reference) = repository
-        .get_credential_reference(&request.credential_id)
-        .unwrap()
-    {
-        let mut store = WindowsDpapiCredentialStore::new(credential_root).unwrap();
-        CredentialService::new(&mut repository, &mut store)
-            .delete_credential(reference.id(), reference.version())
-            .unwrap();
-    }
 }
 
 #[test]
@@ -1738,33 +1753,64 @@ fn two_capture_processes_converge_without_rotation_or_orphans() {
     let source = controlled_source(area.codex_root.clone());
     let request = request(&source, 96);
     let binary = env!("CARGO_BIN_EXE_m26-capture-import-crash");
-    let spawn = || {
-        Command::new(binary)
-            .arg("import")
-            .arg(&area.codex_root)
-            .arg(&area.database)
-            .arg(&credential_root)
-            .arg("96")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
-    let first = spawn();
-    let second = spawn();
-    let first = first.wait_with_output().unwrap();
-    let second = second.wait_with_output().unwrap();
-    let outputs = [first, second];
+    // contender 先完成初始 scan；owner 随后在持有同根锁的 journal 切点阻塞。
+    let mut contender = Command::new(binary)
+        .arg("import")
+        .arg(&area.codex_root)
+        .arg(&area.database)
+        .arg(&credential_root)
+        .arg("97")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut contender_stdout = BufReader::new(contender.stdout.take().unwrap());
+    let mut ready = String::new();
+    contender_stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "IMPORT_READY");
+
+    let mut owner = Command::new(binary)
+        .arg("crash")
+        .arg(&area.codex_root)
+        .arg(&area.database)
+        .arg(&credential_root)
+        .arg("after-journal")
+        .arg("96")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut owner_stdout = BufReader::new(owner.stdout.take().unwrap());
+    ready.clear();
+    owner_stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "READY point=AfterJournalPrepared");
+
+    contender
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    let contender_status = contender.wait().unwrap();
+    let mut contender_output = String::new();
+    contender_stdout
+        .read_to_string(&mut contender_output)
+        .unwrap();
+    let mut contender_error = String::new();
+    contender
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut contender_error)
+        .unwrap();
+    assert_eq!(contender_status.code(), Some(4));
     assert!(
-        outputs.iter().any(|output| output.status.success()),
-        "{} | {}",
-        String::from_utf8_lossy(&outputs[0].stdout),
-        String::from_utf8_lossy(&outputs[1].stdout)
+        contender_output.contains("IMPORT_COMPATIBILITY_PROTECTED IoUnavailable"),
+        "same-root loser must fail at the root-lock boundary: stdout={contender_output} stderr={contender_error}"
     );
-    assert!(outputs.iter().all(|output| {
-        matches!(output.status.code(), Some(0 | 2 | 3 | 4))
-            && !String::from_utf8_lossy(&output.stdout).contains("UNEXPECTED")
-    }));
+    owner.kill().unwrap();
+    owner.wait().unwrap();
 
     let mut repository = SqliteMetadataRepository::open(&area.database).unwrap();
     let mut store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
@@ -1782,6 +1828,32 @@ fn two_capture_processes_converge_without_rotation_or_orphans() {
         .unwrap()
         .unwrap();
     assert_eq!(reference.version(), codex_domain::EntityVersion::initial());
+    assert_eq!(
+        reference.backend(),
+        CredentialBackend::WindowsDpapiCurrentUser
+    );
+    assert_eq!(
+        reference.credential_fingerprint().as_str(),
+        hash_bytes(&auth).as_str()
+    );
+    let binding = CredentialEnvelopeBinding::new(
+        reference.id().clone(),
+        reference.kind(),
+        reference.schema_fingerprint().clone(),
+        reference.version(),
+    );
+    let store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+    let diagnostic: CredentialMaterialDiagnostic = store.inspect(&binding).unwrap();
+    assert!(!diagnostic.material_ref.as_os_str().is_empty());
+    let mut material = ExpectedSecretHash {
+        expected: hash_bytes(&auth),
+        matched: false,
+    };
+    store.read(&binding, &mut material).unwrap();
+    assert!(
+        material.matched,
+        "winner material must match the captured auth document"
+    );
     assert_eq!(
         reference.credential_fingerprint().as_str(),
         hash_bytes(&auth).as_str()
@@ -1806,15 +1878,228 @@ fn two_capture_processes_converge_without_rotation_or_orphans() {
 }
 
 #[test]
+fn different_roots_with_one_credential_compete_beyond_root_lock_and_converge() {
+    let auth = api_key_auth(b'3');
+    let area = TempArea::new("two-roots-shared-credential", &auth);
+    let second_root = area.root.join("controlled-root-two");
+    fs::create_dir_all(&second_root).unwrap();
+    fs::write(second_root.join("config.toml"), config()).unwrap();
+    fs::write(second_root.join("auth.json"), &auth).unwrap();
+    let credential_root = area.root.join("credentials");
+    let first_source = controlled_source(area.codex_root.clone());
+    let second_source = controlled_source(second_root.clone());
+    let first_request = request(&first_source, 100);
+    let mut second_request = request(&second_source, 101);
+    second_request.credential_id = first_request.credential_id.clone();
+    let binary = env!("CARGO_BIN_EXE_m26-capture-import-crash");
+    let spawn = |root: &PathBuf, offset: &str| {
+        Command::new(binary)
+            .arg("import-shared-credential")
+            .arg(root)
+            .arg(&area.database)
+            .arg(&credential_root)
+            .arg(offset)
+            .arg("100")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn(&area.codex_root, "100");
+    let mut second = spawn(&second_root, "101");
+    let mut first_stdout = BufReader::new(first.stdout.take().unwrap());
+    let mut second_stdout = BufReader::new(second.stdout.take().unwrap());
+    let mut ready = String::new();
+    first_stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "OWNER_CAS_READY");
+    ready.clear();
+    second_stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "OWNER_CAS_READY");
+    first.stdin.take().unwrap().write_all(b"release\n").unwrap();
+    second
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    let statuses = [first.wait().unwrap(), second.wait().unwrap()];
+    let mut stdout = [String::new(), String::new()];
+    first_stdout.read_to_string(&mut stdout[0]).unwrap();
+    second_stdout.read_to_string(&mut stdout[1]).unwrap();
+    let mut stderr = [String::new(), String::new()];
+    first
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr[0])
+        .unwrap();
+    second
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr[1])
+        .unwrap();
+    let exit_codes = statuses.map(|status| status.code());
+    assert_eq!(
+        exit_codes.iter().filter(|code| **code == Some(0)).count(),
+        1,
+        "first={:?} {} {} | second={:?} {} {}",
+        statuses[0].code(),
+        stdout[0],
+        stderr[0],
+        statuses[1].code(),
+        stdout[1],
+        stderr[1]
+    );
+    assert_eq!(
+        exit_codes.iter().filter(|code| **code == Some(2)).count(),
+        1
+    );
+    assert_eq!(
+        stdout
+            .iter()
+            .filter(|value| {
+                value.trim() == "IMPORT_IMPORTED" || value.trim() == "IMPORT_ALREADY_IMPORTED"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        stdout
+            .iter()
+            .filter(|value| value.trim() == "IMPORT_CONFLICT")
+            .count(),
+        1
+    );
+    assert!(
+        exit_codes
+            .iter()
+            .all(|code| !matches!(code, Some(3 | 4 | 64 | 65 | 66 | 67) | None)),
+        "helpers must reach the owner/CAS boundary and return only winner/conflict"
+    );
+
+    let repository = SqliteMetadataRepository::open(&area.database).unwrap();
+    let reference = repository
+        .get_credential_reference(&first_request.credential_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.version(), codex_domain::EntityVersion::initial());
+    assert_eq!(
+        reference.backend(),
+        CredentialBackend::WindowsDpapiCurrentUser
+    );
+    assert_eq!(
+        reference.credential_fingerprint().as_str(),
+        hash_bytes(&auth).as_str()
+    );
+    let binding = CredentialEnvelopeBinding::new(
+        reference.id().clone(),
+        reference.kind(),
+        reference.schema_fingerprint().clone(),
+        reference.version(),
+    );
+    let store = WindowsDpapiCredentialStore::new(&credential_root).unwrap();
+    let diagnostic: CredentialMaterialDiagnostic = store.inspect(&binding).unwrap();
+    assert!(!diagnostic.material_ref.as_os_str().is_empty());
+    let mut material = ExpectedSecretHash {
+        expected: hash_bytes(&auth),
+        matched: false,
+    };
+    store.read(&binding, &mut material).unwrap();
+    assert!(
+        material.matched,
+        "winner material must match the shared synthetic auth"
+    );
+    assert!(
+        repository
+            .list_credential_recoveries(&first_request.credential_id)
+            .unwrap()
+            .is_empty()
+    );
+    let identity_presence = [
+        repository
+            .get_runtime_identity(&first_request.identity_id)
+            .unwrap()
+            .is_some(),
+        repository
+            .get_runtime_identity(&second_request.identity_id)
+            .unwrap()
+            .is_some(),
+    ];
+    assert_eq!(
+        identity_presence
+            .into_iter()
+            .filter(|present| *present)
+            .count(),
+        1,
+        "credential owner/CAS must select one initial bundle winner"
+    );
+    let (winner, loser) = if identity_presence[0] {
+        (&first_request, &second_request)
+    } else {
+        (&second_request, &first_request)
+    };
+    let identity = repository
+        .get_runtime_identity(&winner.identity_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.credential().id(), &winner.credential_id);
+    assert_eq!(identity.default_model_preset_id(), Some(&winner.preset_id));
+    assert!(
+        repository
+            .get_model_preset(&winner.preset_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .get_managed_config_patch(&winner.identity_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .get_runtime_identity(&loser.identity_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .get_model_preset(&loser.preset_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .get_managed_config_patch(&loser.identity_id)
+            .unwrap()
+            .is_none()
+    );
+    for request in [&first_request, &second_request] {
+        assert!(
+            repository
+                .get_capture_import_recovery(&format!(
+                    "capture-import:{}",
+                    request.identity_id.as_str()
+                ))
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(repository);
+    cleanup_identity_metadata(&area.database, &second_request);
+    cleanup_dpapi_import(&area.database, &credential_root, &first_request);
+}
+
+#[test]
 fn controlled_scan_fails_closed_while_switch_root_lock_is_held() {
     let auth = api_key_auth(b'6');
     let area = TempArea::new("switch-root-lock", &auth);
     let source = controlled_source(area.codex_root.clone());
-    let _lock = CrossProcessWriteLock::try_acquire(
-        &area.codex_root,
-        UnixMillis::new(20_000).unwrap(),
-    )
-    .unwrap();
+    let _lock =
+        CrossProcessWriteLock::try_acquire(&area.codex_root, UnixMillis::new(20_000).unwrap())
+            .unwrap();
 
     assert!(matches!(
         source.scan(ControlledRoot::DefaultCodex),
@@ -1888,7 +2173,10 @@ fn conflicted_capture_never_deletes_a_preexisting_exact_credential() {
             .unwrap(),
         Some(original)
     );
-    assert_eq!(store.material(&request.credential_id), Some(auth.as_slice()));
+    assert_eq!(
+        store.material(&request.credential_id),
+        Some(auth.as_slice())
+    );
     assert_eq!(store.delete_calls, 0);
 }
 
@@ -1912,10 +2200,7 @@ fn dpapi_reused_credential_rollback_reopen_and_rotation_never_delete_preexisting
             )
             .unwrap();
         let other_reference = existing_credential(
-            CredentialRefId::parse(&format!(
-                "a{index}a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0"
-            ))
-            .unwrap(),
+            CredentialRefId::parse(&format!("a{index}a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0")).unwrap(),
         );
         repository
             .create_credential_reference(&other_reference)
@@ -1981,7 +2266,10 @@ fn dpapi_reused_credential_rollback_reopen_and_rotation_never_delete_preexisting
             .get_credential_reference(&request.credential_id)
             .unwrap()
             .unwrap();
-        assert_eq!(reference.version().value(), if rotate_before_recovery { 2 } else { 1 });
+        assert_eq!(
+            reference.version().value(),
+            if rotate_before_recovery { 2 } else { 1 }
+        );
     }
 }
 
@@ -2018,6 +2306,250 @@ fn capture_schema_rejects_unknown_trigger_without_removing_v11_ledger() {
             Err(OpenRepositoryError::CorruptData)
         ));
     }
+}
+
+#[test]
+fn production_repository_open_accepts_the_checked_in_v11_migration_bytes() {
+    let migration = include_bytes!("../migrations/0011_capture_import_recovery.sql");
+    assert!(migration.windows(2).any(|pair| pair == b"\r\n"));
+    assert!(
+        !migration
+            .windows(2)
+            .any(|pair| pair[0] != b'\r' && pair[1] == b'\n')
+    );
+
+    let auth = api_key_auth(b'M');
+    let area = TempArea::new("real-v11-migration-bytes", &auth);
+    let repository = SqliteMetadataRepository::open(&area.database)
+        .expect("production open must audit the schema produced from the checked-in migration");
+    assert_eq!(repository.schema_version().unwrap(), 11);
+}
+
+#[test]
+fn capture_schema_rejects_semantic_changes_hidden_by_lossy_sql_normalization() {
+    let auth = api_key_auth(b'V');
+    let area = TempArea::new("capture-schema-semantic-collision", &auth);
+    drop(SqliteMetadataRepository::open(&area.database).unwrap());
+    let connection = rusqlite::Connection::open(&area.database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master
+                SET sql=replace(sql, '*[^0-9a-f]*', '*[^0-9a-f ]*')
+              WHERE type='table' AND name='capture_import_operations';
+             PRAGMA writable_schema=OFF;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        SqliteMetadataRepository::open(&area.database).err(),
+        Some(OpenRepositoryError::CorruptData),
+        "GLOB literal semantic tamper must not collide with formatting normalization"
+    );
+}
+
+#[test]
+fn capture_schema_accepts_benign_trigger_literals_and_comments() {
+    let auth = api_key_auth(b'W');
+    let area = TempArea::new("capture-benign-trigger-text", &auth);
+    drop(SqliteMetadataRepository::open(&area.database).unwrap());
+    let connection = rusqlite::Connection::open(&area.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER benign_capture_text
+             AFTER UPDATE ON credential_references
+             BEGIN
+               -- capture_import_operations is documentation, not a table reference.
+               SELECT 'capture_import_operations; INSERT INTO capture_import_operations';
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    SqliteMetadataRepository::open(&area.database)
+        .expect("literal/comment-only mention of the ledger must remain compatible");
+}
+
+#[test]
+fn capture_schema_accepts_equivalent_whitespace_comments_and_statement_semicolons() {
+    let auth = api_key_auth(b'Y');
+    let area = TempArea::new("capture-equivalent-schema-format", &auth);
+    drop(SqliteMetadataRepository::open(&area.database).unwrap());
+    let connection = rusqlite::Connection::open(&area.database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master
+                SET sql=replace(sql, 'CREATE TABLE', 'CREATE /* equivalent format */ TABLE') || ';'
+              WHERE type='table' AND name='capture_import_operations';
+             UPDATE sqlite_master
+                SET sql=replace(sql, 'CREATE INDEX', 'CREATE\n-- equivalent format\nINDEX') || ';'
+              WHERE type='index' AND name='idx_capture_import_unfinished';
+             PRAGMA writable_schema=OFF;",
+        )
+        .unwrap();
+    drop(connection);
+
+    SqliteMetadataRepository::open(&area.database)
+        .expect("format-only schema edits must preserve compatibility");
+}
+
+#[test]
+fn capture_schema_rejects_cross_table_triggers_that_mutate_the_v11_ledger() {
+    for (index, body) in [
+        "INSERT INTO capture_import_operations SELECT * FROM capture_import_operations WHERE 0",
+        "UPDATE capture_import_operations SET phase=phase WHERE 0",
+        "DELETE FROM capture_import_operations WHERE 0",
+        "INSERT OR IGNORE INTO \"capture_import_operations\" SELECT * FROM capture_import_operations WHERE 0",
+        "UPDATE OR IGNORE [capture_import_operations] SET phase=phase WHERE 0",
+        "DELETE FROM `capture_import_operations` WHERE 0",
+        "REPLACE INTO capture_import_operations SELECT * FROM capture_import_operations WHERE 0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let auth = api_key_auth(b'N' + u8::try_from(index).unwrap());
+        let area = TempArea::new("capture-cross-table-trigger", &auth);
+        drop(SqliteMetadataRepository::open(&area.database).unwrap());
+        let connection = rusqlite::Connection::open(&area.database).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER cross_table_capture_{index}\n\
+                 AFTER UPDATE ON credential_references\n\
+                 BEGIN {body}; END;"
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            SqliteMetadataRepository::open(&area.database).err(),
+            Some(OpenRepositoryError::CorruptData),
+            "cross-table trigger body must fail closed: {body}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn write_lock_rejects_a_reparse_file_without_following_or_truncating_its_target() {
+    let auth = api_key_auth(b'Q');
+    let area = TempArea::new("lock-file-reparse", &auth);
+    let outside = area.root.join("outside-lock-target.txt");
+    fs::write(&outside, b"NONSECRET-LOCK-SENTINEL").unwrap();
+    let lock_path = area.codex_root.join(".codextools-write.lock");
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink"])
+        .arg(&lock_path)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        CrossProcessWriteLock::try_acquire(&area.codex_root, UnixMillis::new(30_000).unwrap())
+            .err(),
+        Some(codex_application::SwitchExecutionError::IoFailure)
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"NONSECRET-LOCK-SENTINEL");
+    fs::remove_file(lock_path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn write_lock_rejects_a_reparse_root_without_creating_a_lock_in_the_target() {
+    let auth = api_key_auth(b'R');
+    let area = TempArea::new("lock-root-reparse", &auth);
+    let link = area.root.join("controlled-root-link");
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&area.codex_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        CrossProcessWriteLock::try_acquire(&link, UnixMillis::new(30_001).unwrap()).err(),
+        Some(codex_application::SwitchExecutionError::IoFailure)
+    );
+    assert!(!area.codex_root.join(".codextools-write.lock").exists());
+    fs::remove_dir(link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn write_lock_rejects_an_ancestor_junction_even_when_the_final_root_is_ordinary() {
+    let auth = api_key_auth(b'X');
+    let area = TempArea::new("lock-ancestor-reparse", &auth);
+    let real_parent = area.root.join("real-parent");
+    let controlled_root = real_parent.join("ordinary-controlled-root");
+    fs::create_dir_all(&controlled_root).unwrap();
+    let ancestor_link = area.root.join("ancestor-link");
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&ancestor_link)
+        .arg(&real_parent)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let linked_root = ancestor_link.join("ordinary-controlled-root");
+    assert_eq!(
+        CrossProcessWriteLock::try_acquire(&linked_root, UnixMillis::new(30_003).unwrap()).err(),
+        Some(codex_application::SwitchExecutionError::IoFailure)
+    );
+    assert!(!controlled_root.join(".codextools-write.lock").exists());
+    fs::remove_dir(ancestor_link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn write_lock_pins_each_ancestor_against_replacement_until_release() {
+    let auth = api_key_auth(b'Z');
+    let area = TempArea::new("lock-ancestor-replacement", &auth);
+    let ancestor = area.root.join("pinned-ancestor");
+    let controlled_root = ancestor.join("ordinary-controlled-root");
+    fs::create_dir_all(&controlled_root).unwrap();
+    let moved = area.root.join("pinned-ancestor-moved");
+    let mut lock =
+        CrossProcessWriteLock::try_acquire(&controlled_root, UnixMillis::new(30_004).unwrap())
+            .unwrap();
+
+    assert!(fs::rename(&ancestor, &moved).is_err());
+    lock.release().unwrap();
+    fs::rename(&ancestor, &moved).unwrap();
+    assert!(moved.join("ordinary-controlled-root").is_dir());
+}
+
+#[cfg(windows)]
+#[test]
+fn write_lock_handle_blocks_lock_file_replacement_until_release() {
+    let auth = api_key_auth(b'S');
+    let area = TempArea::new("lock-replacement", &auth);
+    let lock_path = area.codex_root.join(".codextools-write.lock");
+    let moved_path = area.codex_root.join(".codextools-write.lock.moved");
+    let mut lock =
+        CrossProcessWriteLock::try_acquire(&area.codex_root, UnixMillis::new(30_002).unwrap())
+            .unwrap();
+
+    assert!(fs::rename(&lock_path, &moved_path).is_err());
+    assert!(lock_path.is_file());
+    lock.release().unwrap();
+    fs::rename(&lock_path, &moved_path).unwrap();
+    assert!(moved_path.is_file());
 }
 
 #[test]

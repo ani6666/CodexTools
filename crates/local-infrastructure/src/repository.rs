@@ -1,17 +1,17 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use codex_application::{
     BackupKind, BackupRecord, BackupRecoveryOperation, BackupRecoveryPhase, BackupRecoveryRecord,
     BackupRepository, BackupState, CaptureImportCredentialOrigin, CaptureImportDiagnostic,
     CaptureImportPhase, CaptureImportRecoveryRecord, CaptureImportRecoveryRepository,
-    ControlledRoot, ControlledScanId,
-    CredentialRecoveryOperation, CredentialRecoveryPhase, CredentialRecoveryRecord,
-    CredentialRecoveryRepository, CredentialReferenceRepository, EntityKind,
-    IdentityCandidateQuery, ModelPresetRepository, RepositoryError, RuntimeIdentityRepository,
-    SwitchErrorCode, SwitchRecoveryDiagnostic, SwitchTransactionRecord,
+    ControlledRoot, ControlledScanId, CredentialRecoveryOperation, CredentialRecoveryPhase,
+    CredentialRecoveryRecord, CredentialRecoveryRepository, CredentialReferenceRepository,
+    EntityKind, IdentityCandidateQuery, ModelPresetRepository, RepositoryError,
+    RuntimeIdentityRepository, SwitchErrorCode, SwitchRecoveryDiagnostic, SwitchTransactionRecord,
     SwitchTransactionRepository,
 };
 use codex_domain::{
@@ -680,45 +680,29 @@ impl SqliteMetadataRepository {
         if version < 11 {
             return Ok(());
         }
-        let table_sql: String = self
-            .connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='capture_import_operations'",
-                [],
-                |row| row.get(0),
-            )
+        let expected_schema =
+            Connection::open_in_memory().map_err(|_| OpenRepositoryError::CorruptData)?;
+        expected_schema
+            .execute_batch(crate::migration::MIGRATION_0011_SQL)
             .map_err(|_| OpenRepositoryError::CorruptData)?;
-        let expected_table = crate::migration::MIGRATION_0011_SQL
-            .split_once(";\n\nCREATE INDEX")
-            .map(|(table, _)| table)
-            .ok_or(OpenRepositoryError::CorruptData)?;
-        if normalize_schema_sql(&table_sql) != normalize_schema_sql(expected_table) {
+        let actual_table_shape = capture_table_shape(&self.connection)?;
+        let expected_table_shape = capture_table_shape(&expected_schema)?;
+        let actual_index_shape = capture_index_shape(&self.connection)?;
+        let expected_index_shape = capture_index_shape(&expected_schema)?;
+        if actual_table_shape != expected_table_shape || actual_index_shape != expected_index_shape
+        {
             return Err(OpenRepositoryError::CorruptData);
         }
-        let index_sql: String = self
-            .connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_capture_import_unfinished'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| OpenRepositoryError::CorruptData)?;
-        let expected_index = crate::migration::MIGRATION_0011_SQL
-            .split_once("CREATE INDEX")
-            .map(|(_, index)| format!("CREATE INDEX{index}"))
-            .ok_or(OpenRepositoryError::CorruptData)?;
-        if normalize_schema_sql(&index_sql) != normalize_schema_sql(&expected_index) {
-            return Err(OpenRepositoryError::CorruptData);
-        }
-        let strict: i64 = self
-            .connection
-            .query_row(
-                "SELECT strict FROM pragma_table_list WHERE schema='main' AND name='capture_import_operations'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| OpenRepositoryError::CorruptData)?;
-        if strict != 1 {
+        let expected_table =
+            schema_object_sql(&expected_schema, "table", "capture_import_operations")?;
+        let expected_index =
+            schema_object_sql(&expected_schema, "index", "idx_capture_import_unfinished")?;
+        let table_sql = schema_object_sql(&self.connection, "table", "capture_import_operations")?;
+        let index_sql =
+            schema_object_sql(&self.connection, "index", "idx_capture_import_unfinished")?;
+        if tokenize_sql(&table_sql)? != tokenize_sql(&expected_table)?
+            || tokenize_sql(&index_sql)? != tokenize_sql(&expected_index)?
+        {
             return Err(OpenRepositoryError::CorruptData);
         }
         let mut statement = self
@@ -727,9 +711,9 @@ impl SqliteMetadataRepository {
                 "SELECT type,name,tbl_name,sql FROM sqlite_master
                  WHERE (tbl_name='capture_import_operations'
                         OR name='capture_import_operations'
-                        OR (type='view' AND lower(sql) LIKE '%capture_import_operations%'))
-                   AND name NOT LIKE 'sqlite_autoindex_%'
-                 ORDER BY type,name",
+                         OR type IN ('view','trigger'))
+                    AND name NOT LIKE 'sqlite_autoindex_%'
+                  ORDER BY type,name",
             )
             .map_err(|_| OpenRepositoryError::CorruptData)?;
         let objects = statement
@@ -744,37 +728,439 @@ impl SqliteMetadataRepository {
             .map_err(|_| OpenRepositoryError::CorruptData)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| OpenRepositoryError::CorruptData)?;
-        if objects.len() != 2
-            || objects.iter().any(|(kind, name, table, sql)| match kind.as_str() {
+        let mut expected_object_count = 0;
+        for (kind, name, table, sql) in &objects {
+            match kind.as_str() {
                 "table" => {
-                    name != "capture_import_operations"
+                    if name != "capture_import_operations"
                         || table != "capture_import_operations"
                         || sql.as_deref().is_none_or(|value| {
-                            normalize_schema_sql(value) != normalize_schema_sql(expected_table)
+                            tokenize_sql(value).ok() != tokenize_sql(&expected_table).ok()
                         })
+                    {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                    expected_object_count += 1;
                 }
                 "index" => {
-                    name != "idx_capture_import_unfinished"
+                    if name != "idx_capture_import_unfinished"
                         || table != "capture_import_operations"
                         || sql.as_deref().is_none_or(|value| {
-                            normalize_schema_sql(value) != normalize_schema_sql(&expected_index)
+                            tokenize_sql(value).ok() != tokenize_sql(&expected_index).ok()
                         })
+                    {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                    expected_object_count += 1;
                 }
-                _ => true,
-            })
-        {
+                "trigger" => {
+                    let Some(sql) = sql.as_deref() else {
+                        return Err(OpenRepositoryError::CorruptData);
+                    };
+                    if table == "capture_import_operations" || trigger_mutates_capture_ledger(sql)?
+                    {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                }
+                "view" => {
+                    let Some(sql) = sql.as_deref() else {
+                        return Err(OpenRepositoryError::CorruptData);
+                    };
+                    if sql_references_identifier(sql, "capture_import_operations")? {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                }
+                _ => return Err(OpenRepositoryError::CorruptData),
+            }
+        }
+        if expected_object_count != 2 {
             return Err(OpenRepositoryError::CorruptData);
         }
+        audit_capture_constraints(&self.connection)?;
         Ok(())
     }
 }
 
-fn normalize_schema_sql(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != ';')
-        .flat_map(char::to_lowercase)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SqlToken {
+    Identifier(String),
+    StringLiteral(String),
+    Atom(String),
+    Symbol(char),
+}
+
+fn tokenize_sql(value: &str) -> Result<Vec<SqlToken>, OpenRepositoryError> {
+    let bytes = value.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_whitespace() => index += 1,
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                if index + 1 >= bytes.len() {
+                    return Err(OpenRepositoryError::CorruptData);
+                }
+                index += 2;
+            }
+            b'\'' => {
+                let start = index;
+                index += 1;
+                loop {
+                    if index >= bytes.len() {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                    if bytes[index] == b'\'' {
+                        if bytes.get(index + 1) == Some(&b'\'') {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+                tokens.push(SqlToken::StringLiteral(value[start..index].to_owned()));
+            }
+            b'"' | b'`' => {
+                let delimiter = bytes[index];
+                index += 1;
+                let mut identifier = String::new();
+                loop {
+                    if index >= bytes.len() {
+                        return Err(OpenRepositoryError::CorruptData);
+                    }
+                    if bytes[index] == delimiter {
+                        if bytes.get(index + 1) == Some(&delimiter) {
+                            identifier.push(char::from(delimiter));
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        identifier.push(char::from(bytes[index]));
+                        index += 1;
+                    }
+                }
+                tokens.push(SqlToken::Identifier(identifier.to_ascii_lowercase()));
+            }
+            b'[' => {
+                index += 1;
+                let start = index;
+                while index < bytes.len() && bytes[index] != b']' {
+                    index += 1;
+                }
+                if index >= bytes.len() {
+                    return Err(OpenRepositoryError::CorruptData);
+                }
+                tokens.push(SqlToken::Identifier(
+                    value[start..index].to_ascii_lowercase(),
+                ));
+                index += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+                {
+                    index += 1;
+                }
+                tokens.push(SqlToken::Identifier(
+                    value[start..index].to_ascii_lowercase(),
+                ));
+            }
+            byte if byte.is_ascii_digit() => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric()
+                        || matches!(bytes[index], b'.' | b'+' | b'-'))
+                {
+                    index += 1;
+                }
+                tokens.push(SqlToken::Atom(value[start..index].to_ascii_lowercase()));
+            }
+            b';' => index += 1,
+            other if other.is_ascii() => {
+                tokens.push(SqlToken::Symbol(char::from(other)));
+                index += 1;
+            }
+            _ => return Err(OpenRepositoryError::CorruptData),
+        }
+    }
+    Ok(tokens)
+}
+
+fn schema_object_sql(
+    connection: &Connection,
+    kind: &str,
+    name: &str,
+) -> Result<String, OpenRepositoryError> {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
+            |row| row.get(0),
+        )
+        .map_err(|_| OpenRepositoryError::CorruptData)
+}
+
+type TableColumnShape = (i64, String, String, i64, Option<String>, i64, i64);
+type IndexShape = (
+    String,
+    i64,
+    String,
+    i64,
+    Vec<(i64, i64, Option<String>, i64, String, i64)>,
+);
+
+fn capture_table_shape(
+    connection: &Connection,
+) -> Result<(i64, Vec<TableColumnShape>), OpenRepositoryError> {
+    let strict = connection
+        .query_row(
+            "SELECT strict FROM pragma_table_list WHERE schema='main' AND name='capture_import_operations'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden
+             FROM pragma_table_xinfo('capture_import_operations') ORDER BY cid",
+        )
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .map_err(|_| OpenRepositoryError::CorruptData)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    Ok((strict, columns))
+}
+
+fn capture_index_shape(connection: &Connection) -> Result<Vec<IndexShape>, OpenRepositoryError> {
+    let mut list = connection
+        .prepare(
+            "SELECT name, \"unique\", origin, partial
+             FROM pragma_index_list('capture_import_operations') ORDER BY name",
+        )
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    let indexes = list
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| OpenRepositoryError::CorruptData)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    indexes
+        .into_iter()
+        .map(|(name, unique, origin, partial)| {
+            let mut detail = connection
+                .prepare(
+                    "SELECT seqno,cid,name,desc,coll,\"key\"
+                     FROM pragma_index_xinfo(?1) ORDER BY seqno",
+                )
+                .map_err(|_| OpenRepositoryError::CorruptData)?;
+            let columns = detail
+                .query_map([&name], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|_| OpenRepositoryError::CorruptData)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| OpenRepositoryError::CorruptData)?;
+            Ok((name, unique, origin, partial, columns))
+        })
         .collect()
+}
+
+fn sql_references_identifier(sql: &str, expected: &str) -> Result<bool, OpenRepositoryError> {
+    Ok(tokenize_sql(sql)?
+        .iter()
+        .any(|token| matches!(token, SqlToken::Identifier(value) if value == expected)))
+}
+
+fn trigger_mutates_capture_ledger(sql: &str) -> Result<bool, OpenRepositoryError> {
+    let tokens = tokenize_sql(sql)?;
+    for (index, token) in tokens.iter().enumerate() {
+        let SqlToken::Identifier(keyword) = token else {
+            continue;
+        };
+        let target_start = match keyword.as_str() {
+            "insert" => {
+                let mut cursor = index + 1;
+                if identifier_equals(tokens.get(cursor), "or") {
+                    cursor += 2;
+                }
+                if !identifier_equals(tokens.get(cursor), "into") {
+                    continue;
+                }
+                cursor + 1
+            }
+            "replace" => {
+                let cursor = index + 1;
+                if identifier_equals(tokens.get(cursor), "into") {
+                    cursor + 1
+                } else {
+                    cursor
+                }
+            }
+            "update" => {
+                let mut cursor = index + 1;
+                if identifier_equals(tokens.get(cursor), "or") {
+                    cursor += 2;
+                }
+                cursor
+            }
+            "delete" => {
+                if !identifier_equals(tokens.get(index + 1), "from") {
+                    continue;
+                }
+                index + 2
+            }
+            _ => continue,
+        };
+        if target_identifier(&tokens, target_start)
+            .is_some_and(|value| value.eq_ignore_ascii_case("capture_import_operations"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn identifier_equals(token: Option<&SqlToken>, expected: &str) -> bool {
+    matches!(token, Some(SqlToken::Identifier(value)) if value == expected)
+}
+
+fn target_identifier(tokens: &[SqlToken], start: usize) -> Option<&str> {
+    let SqlToken::Identifier(first) = tokens.get(start)? else {
+        return None;
+    };
+    if matches!(tokens.get(start + 1), Some(SqlToken::Symbol('.'))) {
+        let SqlToken::Identifier(second) = tokens.get(start + 2)? else {
+            return None;
+        };
+        Some(second)
+    } else {
+        Some(first)
+    }
+}
+
+fn audit_capture_constraints(connection: &Connection) -> Result<(), OpenRepositoryError> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OpenRepositoryError::CorruptData)?
+        .as_nanos();
+    let operation_id = format!("schema-audit-{}-{nonce:x}", std::process::id());
+    let suffix = nonce & 0xffff_ffff_ffff;
+    let credential_id = format!("00000001-0000-4000-8000-{suffix:012x}");
+    let identity_id = format!("00000002-0000-4000-8000-{suffix:012x}");
+    let preset_id = format!("00000003-0000-4000-8000-{suffix:012x}");
+    let patch_id = format!("00000004-0000-4000-8000-{suffix:012x}");
+    connection
+        .execute_batch("SAVEPOINT codextools_capture_schema_audit")
+        .map_err(|_| OpenRepositoryError::CorruptData)?;
+    let result = (|| {
+        connection
+            .execute(
+                "INSERT INTO capture_import_operations (
+                operation_id,root_selector,scan_id,credential_id,identity_id,identity_name,
+                preset_id,preset_name,patch_id,auth_mode,auth_schema_fingerprint,
+                credential_origin,credential_backend,credential_schema_fingerprint,
+                credential_fingerprint,credential_version,credential_created_at_unix_ms,
+                credential_updated_at_unix_ms,provider_id,provider_display_name,api_base_url,
+                model_id,config_hash,phase,diagnostic_code,created_at_unix_ms,
+                updated_at_unix_ms,version
+             ) VALUES (
+                ?1,'default_codex',?2,?3,?4,'Schema Audit',?5,'Schema Audit',?6,'api_key',?7,
+                'created','windows_dpapi_current_user',?7,?7,1,1,1,'provider','Provider',
+                'https://HOST/v1','model',?7,'prepared',NULL,1,1,1
+             )",
+                params![
+                    operation_id,
+                    "a".repeat(64),
+                    credential_id,
+                    identity_id,
+                    preset_id,
+                    patch_id,
+                    "b".repeat(64),
+                ],
+            )
+            .map_err(|_| OpenRepositoryError::CorruptData)?;
+        for sql in [
+            "UPDATE capture_import_operations SET operation_id='' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET root_selector='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET scan_id=printf('%063s ', '') WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_id='00000000-0000-4000-8000-00000000000z' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET identity_name=' ' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET preset_name=' ' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET auth_mode='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_origin='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_backend='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_version=0 WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_created_at_unix_ms=-1 WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET credential_updated_at_unix_ms=0 WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET provider_id='' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET provider_display_name=' ' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET api_base_url='' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET model_id='' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET phase='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET diagnostic_code='other' WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET created_at_unix_ms=-1 WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET updated_at_unix_ms=0 WHERE operation_id=?1",
+            "UPDATE capture_import_operations SET version=0 WHERE operation_id=?1",
+        ] {
+            if !matches!(
+                connection.execute(sql, [&operation_id]),
+                Err(SqlError::SqliteFailure(error, _)) if error.code == ErrorCode::ConstraintViolation
+            ) {
+                return Err(OpenRepositoryError::CorruptData);
+            }
+        }
+        Ok(())
+    })();
+    let rollback = connection.execute_batch(
+        "ROLLBACK TO codextools_capture_schema_audit; RELEASE codextools_capture_schema_audit",
+    );
+    if rollback.is_err() {
+        return Err(OpenRepositoryError::CorruptData);
+    }
+    result
 }
 
 impl CredentialReferenceRepository for SqliteMetadataRepository {
