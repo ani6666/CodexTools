@@ -5,6 +5,7 @@ import { IdentityManager } from './components/IdentityManager';
 import { LocalCandidate } from './components/LocalCandidate';
 import { PresetManager } from './components/PresetManager';
 import { StatusFeedback } from './components/StatusFeedback';
+import { superviseOperationStatusListener } from './event-channel';
 import { SUPPORTED_LOCALES, type SupportedLocale } from './i18n';
 import { createPresetAndBind, importCandidate, listIdentities, listenOperationStatus, listPresets, renameIdentity, SafeIpcError, scanDefaultCodex, updatePresetAndBind, type IdentitySummary, type PresetSummary } from './ipc';
 import { createInitialM33State, m33Reducer } from './m33-state';
@@ -50,12 +51,14 @@ export function App() {
   useEffect(() => {
     mounted.current = true;
     void refreshIdentities();
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    listenOperationStatus(() => undefined).then((release) => {
-      if (disposed) release(); else unlisten = release;
-    }).catch(() => undefined);
-    return () => { disposed = true; mounted.current = false; unlisten?.(); };
+    const disposeEventChannel = superviseOperationStatusListener(
+      () => listenOperationStatus(() => undefined),
+      (channelState) => dispatchM33({ type: channelState === 'ready' ? 'event-channel-ready' : 'event-channel-unavailable' }),
+    );
+    return () => {
+      mounted.current = false;
+      disposeEventChannel();
+    };
   }, []);
   useEffect(() => { dispatchM33({ type: 'locale-changed' }); }, [state.locale]);
   useEffect(() => { if (selectedIdentityId) void loadPresets(selectedIdentityId); }, [selectedIdentityId]);
@@ -107,7 +110,7 @@ export function App() {
     </aside>
     <main id="main-content" tabIndex={-1}>
       <div className="page-heading"><h1>{t('shell.title')}</h1><span>{t('shell.subtitle')}</span></div>
-      {state.navigation === 'overview' && <div className="workspace-flow"><section aria-labelledby="overview-title"><div className="section-heading"><h2 id="overview-title">{t('overview.title')}</h2><p>{t('overview.description')}</p></div><div className="boundary-strip"><Card title={t('overview.boundaryTitle')}>{t('overview.boundaryBody')}</Card><Card title={t('overview.contractTitle')}>{t('overview.contractBody')}</Card></div></section>{m33.errorCode && <div className="business-error" role="alert" aria-live="assertive">{t(`m33.error.${m33.errorCode}`)}</div>}<LocalCandidate scan={m33.scan} busy={busy} t={t} onScan={runScan} onImport={runImport} /><IdentityManager identities={m33.identities.items} selectedId={selectedIdentityId} loading={m33.identities.status === 'loading'} busy={busy} t={t} onRefresh={refreshIdentities} onSelect={setSelectedIdentityId} onRename={runRename} /><PresetManager identity={selectedIdentity} presets={m33.presets.items} loading={m33.presets.status === 'loading'} busy={busy} t={t} onSave={savePreset} /></div>}
+      {state.navigation === 'overview' && <div className="workspace-flow"><section aria-labelledby="overview-title"><div className="section-heading"><h2 id="overview-title">{t('overview.title')}</h2><p>{t('overview.description')}</p></div><div className="boundary-strip"><Card title={t('overview.boundaryTitle')}>{t('overview.boundaryBody')}</Card><Card title={t('overview.contractTitle')}>{t('overview.contractBody')}</Card></div></section>{m33.eventChannel === 'unavailable' && <div className="event-channel-status" role="status" aria-live="polite" aria-atomic="true">{t('m33.eventChannel.unavailable')}</div>}{m33.errorCode && <div className="business-error" role="alert" aria-live="assertive">{t(`m33.error.${m33.errorCode}`)}</div>}<LocalCandidate scan={m33.scan} busy={busy} t={t} onScan={runScan} onImport={runImport} /><IdentityManager identities={m33.identities.items} selectedId={selectedIdentityId} loading={m33.identities.status === 'loading'} busy={busy} t={t} onRefresh={refreshIdentities} onSelect={setSelectedIdentityId} onRename={runRename} /><PresetManager identity={selectedIdentity} presets={m33.presets.items} loading={m33.presets.status === 'loading'} busy={busy} t={t} onSave={savePreset} /></div>}
       {state.navigation === 'status-lab' && <section aria-labelledby="status-title"><div className="section-heading"><h2 id="status-title">{t('status.title')}</h2><p>{t('status.description')}</p></div><fieldset className="segmented"><legend>{t('status.selectorLabel')}</legend>{displayStates.map((value) => <button key={value} type="button" aria-pressed={state.displayState === value} onClick={() => dispatch({ type: 'show-display-state', displayState: value })}>{t(`state.${value}.title`)}</button>)}</fieldset><StatusFeedback state={state.displayState} title={t(`state.${state.displayState}.title`)} body={t(`state.${state.displayState}.body`)} /></section>}
       {state.navigation === 'preferences' && <section aria-labelledby="preferences-title"><div className="section-heading"><h2 id="preferences-title">{t('preferences.title')}</h2><p>{t('preferences.description')}</p></div><div className="settings-row"><label htmlFor="locale-select"><strong>{t('preferences.languageLabel')}</strong><span>{t('preferences.languageHint')}</span></label><select id="locale-select" value={state.localePreference} onChange={(event) => setLocalePreference(event.target.value as LocalePreference)}><option value="system">{t('locale.system')}</option>{SUPPORTED_LOCALES.map((locale: SupportedLocale) => <option key={locale} value={locale}>{t(locale === 'zh-CN' ? 'locale.zhCN' : 'locale.en')}</option>)}</select></div><Button variant="primary" onClick={() => dispatch({ type: 'notify', tone: 'info', messageKey: 'notification.fixture' })}>{t('action.previewNotification')}</Button></section>}
     </main>

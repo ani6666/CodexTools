@@ -42,3 +42,68 @@ test('IPC listener 生命周期显式保存并调用 unlisten', async () => {
   assert.match(ipc, /unlisten/);
   assert.match(ipc, /return\s+unlisten/);
 });
+
+test('事件通道注册失败进入固定 unavailable 状态且不泄漏技术原文', async () => {
+  const { superviseOperationStatusListener } = await import('../src/event-channel.ts');
+  const states = [];
+  const dispose = superviseOperationStatusListener(
+    () => Promise.reject(new Error('ACL denied: private runtime detail')),
+    (state) => states.push(state),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(states, ['unavailable']);
+  assert.doesNotMatch(states.join(' '), /ACL|denied|private|runtime/i);
+  dispose();
+});
+
+test('事件通道失败不覆盖业务错误或伪造业务成功状态', () => {
+  let state = m33Reducer(createInitialM33State(), { type: 'event-channel-unavailable' });
+  assert.equal(state.eventChannel, 'unavailable');
+  assert.equal(state.errorCode, null);
+  state = m33Reducer(state, { type: 'request-failed', requestToken: 0, code: 'conflict' });
+  assert.equal(state.eventChannel, 'unavailable');
+  assert.equal(state.errorCode, 'conflict');
+});
+
+test('卸载期间迟到的 listener 注册会立即 unlisten 且不再更新状态', async () => {
+  const { superviseOperationStatusListener } = await import('../src/event-channel.ts');
+  let resolveRegistration;
+  let releaseCount = 0;
+  const states = [];
+  const registration = new Promise((resolve) => { resolveRegistration = resolve; });
+  const dispose = superviseOperationStatusListener(() => registration, (state) => states.push(state));
+  dispose();
+  resolveRegistration(async () => { releaseCount += 1; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releaseCount, 1);
+  assert.deepEqual(states, []);
+});
+
+test('unlisten 异步失败被安全吸收且不产生 unhandled rejection', async () => {
+  const { superviseOperationStatusListener } = await import('../src/event-channel.ts');
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const dispose = superviseOperationStatusListener(
+      () => Promise.resolve(() => Promise.reject(new Error('unlisten runtime detail'))),
+      () => undefined,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    dispose();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('事件通道不可用状态提供中英文等键与 aria-live 呈现', async () => {
+  const [i18n, app] = await Promise.all([
+    readFile(path.join(root, 'src', 'i18n.ts'), 'utf8'),
+    readFile(path.join(root, 'src', 'App.tsx'), 'utf8'),
+  ]);
+  assert.equal((i18n.match(/'m33\.eventChannel\.unavailable'/g) ?? []).length, 2);
+  assert.match(app, /m33\.eventChannel\.unavailable/);
+  assert.match(app, /role="status"[^>]*aria-live="polite"/);
+});

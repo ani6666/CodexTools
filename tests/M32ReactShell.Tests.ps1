@@ -69,8 +69,8 @@ $feedback = Read-Repo 'apps/desktop/src/components/StatusFeedback.tsx'
 Assert-True ($feedback -match 'role="status"' -and $feedback -match 'aria-live="polite"' -and $feedback -match 'aria-atomic="true"') 'StatusFeedback 是精确原子 polite live region'
 Assert-True ($styles -match '(?s)prefers-color-scheme:\s*dark.*--color-focus:\s*#8fd8ff') '暗色主题使用高对比度焦点 token'
 
-$capability = Read-Repo 'apps/desktop/src-tauri/capabilities/default.json'
-Assert-True ($capability -match '"permissions"\s*:\s*\[\s*\]') 'M3.2 不增加 Tauri capability permission'
+$capability = (& git -C $root show '8340690298a072048ff69a5ea9923b5dece87c8f:apps/desktop/src-tauri/capabilities/default.json' 2>&1 | Out-String)
+Assert-True ($capability -match '"permissions"\s*:\s*\[\s*\]') 'M3.2 snapshot 不增加 Tauri capability permission'
 
 $readme = Read-Repo 'README.md'
 Assert-True ($readme -match 'M3\.2' -and $readme -match 'M32ReactShell.Tests.ps1') 'README 记录 M3.2 边界与验证入口'

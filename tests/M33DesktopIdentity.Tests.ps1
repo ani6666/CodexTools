@@ -17,6 +17,14 @@ function Read-Repo([string]$RelativePath) {
     Get-Content -LiteralPath $path -Raw
 }
 
+function Test-M33CapabilityPermissionSet([string[]]$Permissions) {
+    $expected = @('core:event:allow-listen', 'core:event:allow-unlisten')
+    $actual = @($Permissions | Sort-Object)
+    $sortedExpected = @($expected | Sort-Object)
+    if ($actual.Count -ne $sortedExpected.Count) { return $false }
+    return (Compare-Object -ReferenceObject $sortedExpected -DifferenceObject $actual).Count -eq 0
+}
+
 Write-Host "M3.3 desktop identity contract: $root"
 $required = @(
     'apps/desktop/src-tauri/src/application_facade/m33.rs',
@@ -40,7 +48,8 @@ $ipc = Read-Repo 'apps/desktop/src/ipc.ts'
 $state = Read-Repo 'apps/desktop/src/m33-state.ts'
 $components = (Read-Repo 'apps/desktop/src/components/LocalCandidate.tsx') + (Read-Repo 'apps/desktop/src/components/IdentityManager.tsx') + (Read-Repo 'apps/desktop/src/components/PresetManager.tsx')
 $package = Read-Repo 'apps/desktop/package.json'
-$capability = Read-Repo 'apps/desktop/src-tauri/capabilities/default.json'
+$capabilityText = Read-Repo 'apps/desktop/src-tauri/capabilities/default.json'
+$capability = if ($capabilityText) { $capabilityText | ConvertFrom-Json } else { $null }
 
 Assert-True ($contract -match 'M33_CONTRACT_VERSION' -and $contract -match 'deny_unknown_fields') 'M3.3 typed DTO 版本化且拒绝未知字段'
 Assert-True ($contract -match 'DefaultCodex' -and $contract -notmatch 'PathBuf|&Path|Vec<u8>') 'IPC 只接受受控根且无真实路径/字节类型'
@@ -62,11 +71,18 @@ Assert-True ($commands -match 'spawn_blocking') 'SQLite/DPAPI 命令离开 UI �
 Assert-True ($library -match 'TauriEventSink' -and $library -match 'app_data_dir') 'composition root 在后端解析 app data 并提供 typed event sink'
 
 Assert-True ($package -match '"@tauri-apps/api"\s*:\s*"2\.11\.0"') '仅新增锁定版本的官方 Tauri invoke/listen API'
-Assert-True ($capability -match '"permissions"\s*:\s*\[\s*\]') '自定义 commands 不扩大 capability 权限'
+Assert-True ($null -ne $capability -and (Test-M33CapabilityPermissionSet @($capability.permissions))) 'capability 精确授予 event listen/unlisten 两项权限'
+Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-unlisten'))) '缺少 allow-listen 的权限 fixture 被拒绝'
+Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen'))) '缺少 allow-unlisten 的权限 fixture 被拒绝'
+Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen', 'core:event:allow-unlisten', 'core:default'))) '增加 core:default 的越权 fixture 被拒绝'
+Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen', 'core:event:allow-unlisten', 'core:event:allow-emit'))) '增加 event emit 的越权 fixture 被拒绝'
 Assert-True ($ipc -match "@tauri-apps/api/core" -and $ipc -match "@tauri-apps/api/event") '前端仅使用官方 invoke/listen 子模块'
+Assert-True ($ipc -match '\blisten\(' -and $ipc -notmatch '\bemit\(') '前端只监听 operation status，不调用 event emit'
 Assert-True ($ipc -notmatch '(?i)access[_-]?token|refresh[_-]?token|authorization|credential[_-]?material|CODEX_HOME|auth\.json|config\.toml') '前端 IPC 层不接触秘密或真实路径'
 Assert-True ($state -match 'requestToken' -and $state -match 'stale' -and $state -match 'unmounted') '状态机防止 stale response 与卸载后更新'
+Assert-True ($state -match 'eventChannel' -and $state -match 'event-channel-unavailable') '事件通道失败与业务请求错误分离建模'
 Assert-True ($app -notmatch '(?s)useEffect\(\(\)\s*=>\s*\{[^}]*scanDefaultCodex') '挂载/语言切换不会自动扫描'
+Assert-True ($app -match 'm33\.eventChannel\.unavailable' -and $app -match 'role="status"') '监听失败进入本地化、可访问的安全不可用状态'
 Assert-True ($components -match 'local-candidate' -and $components -match 'saved-identities' -and $components -match 'model-presets') '信息架构明确区分候选、身份与预设'
 Assert-True (($app + $components) -match 'aria-live' -and ($app + $components) -match 'aria-busy') '业务区提供 live/busy 可访问状态'
 

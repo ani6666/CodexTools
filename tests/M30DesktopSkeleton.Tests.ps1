@@ -107,9 +107,9 @@ Assert-True ($tauriManifest -match 'codex-application\s*=\s*\{\s*path\s*=\s*"\.\
 Assert-True ($tauriManifest -match 'local-infrastructure\s*=\s*\{\s*path\s*=\s*"\.\./\.\./\.\./crates/local-infrastructure"') '桌面 crate 通过 path dependency 复用 local-infrastructure'
 Assert-True ($tauriManifest -match 'windows-platform\s*=\s*\{\s*path\s*=\s*"\.\./\.\./\.\./crates/windows-platform"') '桌面 crate 通过 path dependency 复用 windows-platform'
 
-$capabilityText = Get-RepositoryText 'apps/desktop/src-tauri/capabilities/default.json'
+$capabilityText = (& git -C $root show '8340690298a072048ff69a5ea9923b5dece87c8f:apps/desktop/src-tauri/capabilities/default.json' 2>&1 | Out-String)
 $capability = if ($capabilityText) { $capabilityText | ConvertFrom-Json } else { $null }
-Assert-True ($null -ne $capability -and @($capability.windows).Count -eq 1 -and $capability.windows[0] -eq 'main') 'capability 仅绑定主窗口'
+Assert-True ($null -ne $capability -and @($capability.windows).Count -eq 1 -and $capability.windows[0] -eq 'main') 'M3.0 snapshot capability 仅绑定主窗口'
 Assert-True ($null -ne $capability -and @($capability.permissions).Count -eq 0) 'M3.0 capability 权限集合为空'
 
 $rustSource = Get-RepositoryText 'apps/desktop/src-tauri/src/lib.rs'

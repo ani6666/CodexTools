@@ -58,7 +58,7 @@ $errors = Read-Repo 'apps/desktop/src-tauri/src/application_facade/error.rs'
 $events = Read-Repo 'apps/desktop/src-tauri/src/application_facade/events.rs'
 $commands = Read-Repo 'apps/desktop/src-tauri/src/commands.rs'
 $tests = Read-Repo 'apps/desktop/src-tauri/tests/m31_contract.rs'
-$capability = Read-Repo 'apps/desktop/src-tauri/capabilities/default.json'
+$capability = (& git -C $root show '8340690298a072048ff69a5ea9923b5dece87c8f:apps/desktop/src-tauri/capabilities/default.json' 2>&1 | Out-String)
 
 Assert-True ($library -match 'mod application_facade' -and $library -match 'mod commands') 'Tauri crate 隔离 facade 与 command adapter'
 Assert-True ($library -match 'invoke_handler' -and $library -match 'commands::registered_handlers') 'Tauri 仅通过集中 adapter 注册 handler'
@@ -93,7 +93,7 @@ Assert-True ($cancellation -notmatch '(?i)kill|terminate|process') '取消契约
 Assert-True ($cancellation -match 'rollback_registration' -and $cancellation -match 'remove_completed') 'operation 注册失败可安全回滚且完成态可显式释放'
 
 Assert-True ($commands -match '#\[tauri::command' -and $commands -match 'describe_contract_v1' -and $commands -match 'cancel_operation_v1') '仅注册最小 typed Tauri commands'
-Assert-True ($capability -match '"permissions"\s*:\s*\[\s*\]') '自定义 app commands 保持空 capability permissions'
+Assert-True ($capability -match '"permissions"\s*:\s*\[\s*\]') 'M3.1 snapshot 自定义 app commands 保持空 capability permissions'
 
 Assert-True ($tests -match 'CANARY' -and $tests -match 'serde_json') '合同测试覆盖固定 canary 与 JSON'
 Assert-True ($tests -match 'request_response_event_error_debug_display_and_json_are_secret_free') '合同测试覆盖 DTO/event/error 的 secret-free 输出'

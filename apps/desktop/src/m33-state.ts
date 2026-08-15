@@ -4,6 +4,7 @@ type AsyncStatus = 'idle' | 'loading' | 'success' | 'error';
 export interface M33State {
   mounted: boolean;
   requestToken: number;
+  eventChannel: 'connecting' | 'ready' | 'unavailable';
   scan: { status: 'idle' | 'scanning' | ScanResult['status']; candidate: ScanResult['candidate']; existingIdentityId: string | null };
   identities: { status: AsyncStatus; items: IdentitySummary[] };
   presets: { status: AsyncStatus; identityId: string | null; items: PresetSummary[] };
@@ -13,6 +14,8 @@ export interface M33State {
 export type M33Action =
   | { type: 'locale-changed' }
   | { type: 'unmounted' }
+  | { type: 'event-channel-ready' }
+  | { type: 'event-channel-unavailable' }
   | { type: 'scan-started'; requestToken: number }
   | { type: 'scan-finished'; requestToken: number; result: ScanResult }
   | { type: 'request-failed'; requestToken: number; code: SafeErrorCode }
@@ -25,6 +28,7 @@ export function createInitialM33State(): M33State {
   return {
     mounted: true,
     requestToken: 0,
+    eventChannel: 'connecting',
     scan: { status: 'idle', candidate: null, existingIdentityId: null },
     identities: { status: 'idle', items: [] },
     presets: { status: 'idle', identityId: null, items: [] },
@@ -40,6 +44,8 @@ export function m33Reducer(state: M33State, action: M33Action): M33State {
   switch (action.type) {
     case 'locale-changed': return state;
     case 'unmounted': return { ...state, mounted: false };
+    case 'event-channel-ready': return state.mounted ? { ...state, eventChannel: 'ready' } : state;
+    case 'event-channel-unavailable': return state.mounted ? { ...state, eventChannel: 'unavailable' } : state;
     case 'scan-started': return { ...state, requestToken: action.requestToken, errorCode: null, scan: { status: 'scanning', candidate: null, existingIdentityId: null } };
     case 'scan-finished': return stale(state, action.requestToken) ? state : { ...state, scan: { status: action.result.status, candidate: action.result.candidate, existingIdentityId: action.result.existingIdentityId ?? null } };
     case 'identities-started': return { ...state, requestToken: action.requestToken, errorCode: null, identities: { ...state.identities, status: 'loading' } };

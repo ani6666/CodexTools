@@ -26,9 +26,9 @@ M3.3 将 M2.6/M2.7 的已放行服务接入桌面生产路径。首次扫描只�
 
 身份列表、刷新和 rename 使用真实 SQLite repository 与 optimistic concurrency；首个身份仍只能来自 M2.6 受控导入或已有安全 reference。模型预设列表、create-and-bind 与 update-and-bind 复用 M2.7 `PresetBindingService`，前端不会用多个 invoke 拼装原子操作。managed name/model 在 DTO 构造和 domain 服务两层拒绝高置信秘密与路径形态。前端对 stale response、重复点击、卸载、IPC reject、空/加载/验证/冲突/恢复状态均使用稳定安全消息，不显示技术错误原文。
 
-Tauri adapter 仍集中在 `commands.rs`，所有 SQLite/DPAPI 工作通过 `spawn_blocking` 离开 UI 线程。`TauriEventSink` 仅发射阶段、计数、opaque id 与安全 summary code；Accepted 投递失败会在调用后端前回滚 operation 注册。capability 继续只绑定 `main` 窗口且 permissions 为空，没有引入 shell/fs/dialog/http/process plugin 或网络权限。M3.3 合同入口为 `pwsh -NoProfile -File .\tests\M33DesktopIdentity.Tests.ps1`、`cargo test -p codextools-desktop --test m33_contract --all-features` 与 `npm test`。
+Tauri adapter 仍集中在 `commands.rs`，所有 SQLite/DPAPI 工作通过 `spawn_blocking` 离开 UI 线程。`TauriEventSink` 仅发射阶段、计数、opaque id 与安全 summary code；Accepted 投递失败会在调用后端前回滚 operation 注册。capability 继续只绑定 `main` 窗口，并仅授予 `core:event:allow-listen` 与 `core:event:allow-unlisten`；没有 event emit、shell/fs/dialog/http/process plugin 或网络权限。监听注册失败会进入固定、本地化的事件通道不可用状态，业务 invoke 结果仍独立呈现；卸载竞态和异步 unlisten 失败不会形成卸载后状态更新或未处理拒绝。M3.3 合同入口为 `pwsh -NoProfile -File .\tests\M33DesktopIdentity.Tests.ps1`、`cargo test -p codextools-desktop --test m33_contract --all-features` 与 `npm test`。
 
-capability 仅绑定 `main` 窗口，权限数组为空；后续任何文件系统、Shell、窗口或业务命令权限都必须逐项评审。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token 或 Authorization 正文入口。
+capability 仅绑定 `main` 窗口，当前权限数组精确为事件 `listen/unlisten` 两项；后续任何 event emit、文件系统、Shell、窗口或业务命令权限都必须逐项评审。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token 或 Authorization 正文入口。
 
 ### M3.0 依赖、许可证与体积评估
 

@@ -106,6 +106,7 @@ input { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid var(
 .confirmation-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-5); margin-top: var(--space-4); }
 .confirmation-row p { max-width: 70ch; margin: 0; color: var(--color-muted); line-height: 1.5; }
 .business-error { padding: var(--space-4); border: 1px solid #c98181; border-radius: var(--radius-md); color: #6e2020; background: #fff2f2; }
+.event-channel-status { padding: var(--space-4); border: 1px solid #c79845; border-radius: var(--radius-md); color: #65420a; background: #fff5df; line-height: 1.5; }
 .empty-copy { margin: 0; padding: var(--space-5); border: 1px dashed var(--color-border); border-radius: var(--radius-md); color: var(--color-muted); text-align: center; }
 .identity-layout { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(280px, 1.2fr); gap: var(--space-5); align-items: start; }
 .selection-list { display: grid; gap: var(--space-2); }
@@ -158,5 +159,6 @@ input { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid var(
   .business-status--candidate, .business-status--duplicate, .selection-item--active { background: #203b2f; }
   .business-status--conflict, .business-status--compatibility_protected, .business-status--recovery_required, .business-status--error { background: #3b2d18; }
   .business-error { color: #ffdada; background: #3a2020; }
+  .event-channel-status { color: #ffe8b3; background: #392d18; }
   .status-chip { color: #dff8ec !important; background: #24543f; }
 }
