@@ -232,3 +232,19 @@ impl From<super::M33BackendError> for ErrorEnvelope {
         Self::from_code(code)
     }
 }
+
+impl From<super::M34BackendError> for ErrorEnvelope {
+    fn from(error: super::M34BackendError) -> Self {
+        let code = match error {
+            super::M34BackendError::Validation => ErrorCode::Validation,
+            super::M34BackendError::NotFound => ErrorCode::NotFound,
+            super::M34BackendError::Conflict => ErrorCode::Conflict,
+            super::M34BackendError::PlanStale => ErrorCode::PlanStale,
+            super::M34BackendError::CompatibilityProtected => ErrorCode::CompatibilityProtected,
+            super::M34BackendError::RecoveryRequired => ErrorCode::RecoveryRequired,
+            super::M34BackendError::Unavailable => ErrorCode::Unavailable,
+            super::M34BackendError::Internal => ErrorCode::Internal,
+        };
+        Self::from_code(code)
+    }
+}

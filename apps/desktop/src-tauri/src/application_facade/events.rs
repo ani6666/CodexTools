@@ -13,7 +13,16 @@ pub enum OperationStage {
     AwaitingApproval,
     ExecutingAtomic,
     Verifying,
+    Queued,
+    Preparing,
+    Validated,
+    EnteringCritical,
+    Committing,
     Completed,
+    Cancelled,
+    Conflict,
+    RecoveryRequired,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,6 +81,27 @@ impl OperationStatusEvent {
             completed_items: u64::from(succeeded),
             total_items: Some(1),
             summary_code: Some(summary_code),
+        }
+    }
+
+    #[must_use]
+    pub fn progress(
+        operation_id: SafeIdentifier,
+        correlation_id: SafeIdentifier,
+        stage: OperationStage,
+        status: OperationStatus,
+        completed_items: u64,
+        total_items: Option<u64>,
+    ) -> Self {
+        Self {
+            schema_version: M31_CONTRACT_VERSION,
+            operation_id,
+            correlation_id,
+            stage,
+            status,
+            completed_items,
+            total_items,
+            summary_code: None,
         }
     }
 }

@@ -8,6 +8,7 @@ use tauri::{Emitter, Manager};
 pub mod application_facade;
 mod commands;
 mod m33_backend;
+mod m34_backend;
 
 #[derive(Clone)]
 struct TauriEventSink(tauri::AppHandle);
@@ -51,12 +52,15 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
-            let backend = m33_backend::ProductionM33Backend::new(app_data_dir)
+            let m33_backend = m33_backend::ProductionM33Backend::new(&app_data_dir)
                 .map_err(|_| std::io::Error::other("M3.3 本地服务初始化失败"))?;
+            let m34_backend = m34_backend::ProductionM34Backend::new(&app_data_dir)
+                .map_err(|_| std::io::Error::other("M3.4 本地服务初始化失败"))?;
             let events = Arc::new(TauriEventSink(app.handle().clone()));
-            app.manage(application_facade::ApplicationFacade::with_backend(
+            app.manage(application_facade::ApplicationFacade::with_backends(
                 events,
-                Arc::new(backend),
+                Arc::new(m33_backend),
+                Arc::new(m34_backend),
             ));
             Ok(())
         })

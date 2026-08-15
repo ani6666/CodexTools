@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
@@ -38,7 +39,7 @@ test('M3.3 前端 IPC 仍不建立秘密材料或真实路径入口', async () =
   }
 });
 
-test('M3.3 Rust 只通过集中 typed command adapter 暴露必要命令', async () => {
+test('M3.3 snapshot 与当前 M3.4 均只通过集中 typed command adapter 暴露必要命令', async () => {
   const rustRoot = path.join(desktopRoot, 'src-tauri', 'src');
   const rustFiles = await listFiles(rustRoot);
   const commandLocations = [];
@@ -51,10 +52,44 @@ test('M3.3 Rust 只通过集中 typed command adapter 暴露必要命令', async
   assert.deepEqual(commandLocations, ['commands.rs']);
   assert.deepEqual(invokeHandlerLocations, ['lib.rs']);
 
+  const m33Commands = execFileSync(
+    'git',
+    ['show', '446aa3b970fa5ee6e170f8fd70160c3781a65623:apps/desktop/src-tauri/src/commands.rs'],
+    { cwd: path.resolve(desktopRoot, '..', '..'), encoding: 'utf8' },
+  );
+  assert.equal((m33Commands.match(/#\[tauri::command\]/g) ?? []).length, 9);
+  for (const command of [
+    'describe_contract_v1',
+    'cancel_operation_v1',
+    'scan_default_codex_v1',
+    'import_candidate_v1',
+    'list_identities_v1',
+    'rename_identity_v1',
+    'list_presets_v1',
+    'create_preset_and_bind_v1',
+    'update_preset_and_bind_v1',
+  ]) assert.match(m33Commands, new RegExp(command));
+
   const commands = await readFile(path.join(rustRoot, 'commands.rs'), 'utf8');
-  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 9);
-  assert.match(commands, /describe_contract_v1/);
-  assert.match(commands, /cancel_operation_v1/);
-  for (const command of ['scan_default_codex_v1', 'import_candidate_v1', 'list_identities_v1', 'rename_identity_v1', 'list_presets_v1', 'create_preset_and_bind_v1', 'update_preset_and_bind_v1']) assert.match(commands, new RegExp(command));
+  const currentCommands = [
+    ...commands.matchAll(/#\[tauri::command\]\s*pub (?:async )?fn ([a-z0-9_]+)\(/g),
+  ].map((match) => match[1]);
+  assert.deepEqual(currentCommands, [
+    'describe_contract_v1',
+    'cancel_operation_v1',
+    'scan_default_codex_v1',
+    'import_candidate_v1',
+    'list_identities_v1',
+    'rename_identity_v1',
+    'list_presets_v1',
+    'create_preset_and_bind_v1',
+    'update_preset_and_bind_v1',
+    'preview_switch_v1',
+    'execute_switch_v1',
+    'query_switch_operation_v1',
+    'list_switch_recoveries_v1',
+    'recover_switch_v1',
+  ]);
+  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 14);
   assert.doesNotMatch(commands, /PathBuf|&Path|Vec<u8>|api[_-]?key|access[_-]?token|authorization|cookie/i);
 });

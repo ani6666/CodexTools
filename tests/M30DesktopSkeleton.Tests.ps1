@@ -114,9 +114,10 @@ Assert-True ($null -ne $capability -and @($capability.permissions).Count -eq 0) 
 
 $rustSource = Get-RepositoryText 'apps/desktop/src-tauri/src/lib.rs'
 $commandAdapter = Get-RepositoryText 'apps/desktop/src-tauri/src/commands.rs'
+$m33CommandAdapter = (& git -C $root show '446aa3b970fa5ee6e170f8fd70160c3781a65623:apps/desktop/src-tauri/src/commands.rs' 2>&1 | Out-String)
 Assert-True ($rustSource -match '#!\[forbid\(unsafe_code\)\]') '桌面 Rust crate 禁止 unsafe'
 Assert-True ($rustSource -match 'mod commands' -and $rustSource -match 'invoke_handler') 'M3.1 通过集中 adapter 注册 command handler'
-Assert-True ($commandAdapter -match '#\[tauri::command\]' -and ([regex]::Matches($commandAdapter, '#\[tauri::command\]').Count -eq 9) -and $commandAdapter -match 'scan_default_codex_v1' -and $commandAdapter -match 'update_preset_and_bind_v1') 'M3.3 仅在集中 adapter 注册九个必要 typed commands'
+Assert-True ($m33CommandAdapter -match '#\[tauri::command\]' -and ([regex]::Matches($m33CommandAdapter, '#\[tauri::command\]').Count -eq 9) -and $m33CommandAdapter -match 'scan_default_codex_v1' -and $m33CommandAdapter -match 'update_preset_and_bind_v1') 'M3.3 snapshot 仅在集中 adapter 注册九个必要 typed commands'
 Assert-True ($rustSource -notmatch '(?i)CODEX_HOME|auth\.json|config\.toml|secret|token|cookie|oauth') '桌面入口不读取或命名秘密与真实 Codex 材料'
 
 $language = Get-RepositoryText 'apps/desktop/src/language.ts'

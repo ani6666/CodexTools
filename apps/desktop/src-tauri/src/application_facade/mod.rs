@@ -3,6 +3,7 @@ mod contract;
 mod error;
 mod events;
 mod m33;
+mod m34;
 
 use std::sync::{Arc, Mutex};
 
@@ -21,11 +22,13 @@ pub use events::{
     OperationStatus, OperationStatusEvent,
 };
 pub use m33::*;
+pub use m34::*;
 
 pub struct ApplicationFacade {
     operations: Arc<Mutex<OperationRegistry>>,
     events: Arc<dyn EventSink>,
     m33: Arc<dyn M33Backend>,
+    m34: Arc<dyn M34Backend>,
 }
 
 impl Clone for ApplicationFacade {
@@ -34,6 +37,7 @@ impl Clone for ApplicationFacade {
             operations: Arc::clone(&self.operations),
             events: Arc::clone(&self.events),
             m33: Arc::clone(&self.m33),
+            m34: Arc::clone(&self.m34),
         }
     }
 }
@@ -59,15 +63,29 @@ impl Default for ApplicationFacade {
 impl ApplicationFacade {
     #[must_use]
     pub fn new(events: Arc<dyn EventSink>) -> Self {
-        Self::with_backend(events, Arc::new(UnavailableM33Backend))
+        Self::with_backends(
+            events,
+            Arc::new(UnavailableM33Backend),
+            Arc::new(UnavailableM34Backend),
+        )
     }
 
     #[must_use]
     pub fn with_backend(events: Arc<dyn EventSink>, m33: Arc<dyn M33Backend>) -> Self {
+        Self::with_backends(events, m33, Arc::new(UnavailableM34Backend))
+    }
+
+    #[must_use]
+    pub fn with_backends(
+        events: Arc<dyn EventSink>,
+        m33: Arc<dyn M33Backend>,
+        m34: Arc<dyn M34Backend>,
+    ) -> Self {
         Self {
             operations: Arc::new(Mutex::new(OperationRegistry::default())),
             events,
             m33,
+            m34,
         }
     }
 

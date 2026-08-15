@@ -1,10 +1,13 @@
 use crate::application_facade::{
     ApplicationFacade, CancelOperationRequest, CancelOperationResponse, CreatePresetAndBindRequest,
     DescribeContractRequest, DescribeContractResponse, ErrorCode, ErrorEnvelope,
-    ImportCandidateRequest, ImportCandidateResponse, ListIdentitiesRequest, ListIdentitiesResponse,
-    ListPresetsRequest, ListPresetsResponse, PresetBindingResponse, RenameIdentityRequest,
-    RenameIdentityResponse, ScanDefaultCodexRequest, ScanDefaultCodexResponse,
-    UpdatePresetAndBindRequest,
+    ExecuteSwitchRequest, ExecuteSwitchResponse, ImportCandidateRequest, ImportCandidateResponse,
+    ListIdentitiesRequest, ListIdentitiesResponse, ListPresetsRequest, ListPresetsResponse,
+    ListSwitchRecoveriesRequest, ListSwitchRecoveriesResponse, PresetBindingResponse,
+    PreviewSwitchRequest, PreviewSwitchResponse, QuerySwitchOperationRequest,
+    QuerySwitchOperationResponse, RecoverSwitchRequest, RecoverSwitchResponse,
+    RenameIdentityRequest, RenameIdentityResponse, ScanDefaultCodexRequest,
+    ScanDefaultCodexResponse, UpdatePresetAndBindRequest,
 };
 
 #[tauri::command]
@@ -94,6 +97,51 @@ pub async fn update_preset_and_bind_v1(
     run_blocking(move || facade.update_preset_and_bind(request)).await
 }
 
+#[tauri::command]
+pub async fn preview_switch_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: PreviewSwitchRequest,
+) -> Result<PreviewSwitchResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.preview_switch(request)).await
+}
+
+#[tauri::command]
+pub async fn execute_switch_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: ExecuteSwitchRequest,
+) -> Result<ExecuteSwitchResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.execute_switch(request)).await
+}
+
+#[tauri::command]
+pub async fn query_switch_operation_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: QuerySwitchOperationRequest,
+) -> Result<QuerySwitchOperationResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.query_switch_operation(request)).await
+}
+
+#[tauri::command]
+pub async fn list_switch_recoveries_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: ListSwitchRecoveriesRequest,
+) -> Result<ListSwitchRecoveriesResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.list_switch_recoveries(request)).await
+}
+
+#[tauri::command]
+pub async fn recover_switch_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: RecoverSwitchRequest,
+) -> Result<RecoverSwitchResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.recover_switch(request)).await
+}
+
 pub fn registered_handlers<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool {
     tauri::generate_handler![
         describe_contract_v1,
@@ -104,6 +152,11 @@ pub fn registered_handlers<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>
         rename_identity_v1,
         list_presets_v1,
         create_preset_and_bind_v1,
-        update_preset_and_bind_v1
+        update_preset_and_bind_v1,
+        preview_switch_v1,
+        execute_switch_v1,
+        query_switch_operation_v1,
+        list_switch_recoveries_v1,
+        recover_switch_v1
     ]
 }

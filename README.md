@@ -30,6 +30,14 @@ Tauri adapter 仍集中在 `commands.rs`，所有 SQLite/DPAPI 工作通过 `spa
 
 capability 仅绑定 `main` 窗口，当前权限数组精确为事件 `listen/unlisten` 两项；后续任何 event emit、文件系统、Shell、窗口或业务命令权限都必须逐项评审。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token 或 Authorization 正文入口。
 
+### M3.4 身份切换与恢复流程
+
+M3.4 复用 M2.5 `VerticalSwitchPlanner::preview_from_store` 与 `execute_approved`：用户只能从已保存身份显式生成只读预览，后端保留绑定当前 config/auth baseline、身份/预设/credential 版本和过期时间的 `VerticalPreparedIntent`。前端批准时只回传 opaque plan id、plan version 与 operation id；执行前后均重新读取仓储与 credential owner，并逐字段重算同一意图。任何 local state、身份、预设或 credential 变化都会返回 `plan_stale`，不会静默重新规划。
+
+执行沿用 M2.3 跨进程写锁、联合快照、原子替换、journal 与 `recover_root`。取消只在进入原子临界区前生效；进入后稳定返回 `too_late`，事务仍会完成或进入恢复。typed event 只含阶段、计数和 opaque ids；事件失败不会中断已进入临界区的事务，UI 以最终 command/query 结果收敛。重启后可用 opaque operation id 查询持久 switch transaction；pending/recovery 仅显示安全摘要，恢复必须再次明确确认且不会自动启动。
+
+React 在既有身份与预设管理下增加 preview 摘要、明确确认、进度、取消太晚、冲突和恢复状态。中英文资源、`aria-live`、`aria-busy`、原生 `progress`、键盘和窄窗均保持；浏览器 storage 只保存 opaque pending operation id。capability 仍精确为 `core:event:allow-listen` 与 `core:event:allow-unlisten`，没有新增依赖、plugin、event emit、网络或 schema migration。合同入口为 `pwsh -NoProfile -File .\tests\M34IdentitySwitch.Tests.ps1`、`cargo test -p codextools-desktop --test m34_contract --all-features`、`cargo test -p codextools-desktop --lib m34_backend --all-features` 与 `npm test`。
+
 ### M3.0 依赖、许可证与体积评估
 
 直接新增依赖均在锁文件中精确解析：

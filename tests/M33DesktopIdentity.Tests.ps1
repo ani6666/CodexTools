@@ -77,7 +77,7 @@ Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen'))
 Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen', 'core:event:allow-unlisten', 'core:default'))) '增加 core:default 的越权 fixture 被拒绝'
 Assert-True (-not (Test-M33CapabilityPermissionSet @('core:event:allow-listen', 'core:event:allow-unlisten', 'core:event:allow-emit'))) '增加 event emit 的越权 fixture 被拒绝'
 Assert-True ($ipc -match "@tauri-apps/api/core" -and $ipc -match "@tauri-apps/api/event") '前端仅使用官方 invoke/listen 子模块'
-Assert-True ($ipc -match '\blisten\(' -and $ipc -notmatch '\bemit\(') '前端只监听 operation status，不调用 event emit'
+Assert-True ($ipc -match '\blisten(?:<[^>]+>)?\(' -and $ipc -notmatch '\bemit(?:<[^>]+>)?\(') '前端只监听 operation status，不调用 event emit'
 Assert-True ($ipc -notmatch '(?i)access[_-]?token|refresh[_-]?token|authorization|credential[_-]?material|CODEX_HOME|auth\.json|config\.toml') '前端 IPC 层不接触秘密或真实路径'
 Assert-True ($state -match 'requestToken' -and $state -match 'stale' -and $state -match 'unmounted') '状态机防止 stale response 与卸载后更新'
 Assert-True ($state -match 'eventChannel' -and $state -match 'event-channel-unavailable') '事件通道失败与业务请求错误分离建模'

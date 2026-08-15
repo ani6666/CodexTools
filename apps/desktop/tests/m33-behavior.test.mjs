@@ -107,3 +107,29 @@ test('事件通道不可用状态提供中英文等键与 aria-live 呈现', asy
   assert.match(app, /m33\.eventChannel\.unavailable/);
   assert.match(app, /role="status"[^>]*aria-live="polite"/);
 });
+
+test('event-channel 状态观察回调抛错不会形成 unhandled rejection', async () => {
+  const { superviseOperationStatusListener } = await import('../src/event-channel.ts');
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const dispose = superviseOperationStatusListener(
+      () => Promise.resolve(() => undefined),
+      () => { throw new Error('observer failure detail'); },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    dispose();
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('production IPC event 通知边界吸收业务观察回调异常', async () => {
+  const { notifyOperationStatus } = await import('../src/ipc.ts');
+  assert.doesNotThrow(() => notifyOperationStatus(
+    () => { throw new Error('event observer failure detail'); },
+    { schema_version: 1, operation_id: 'opaque-op', correlation_id: 'opaque-corr', stage: 'queued', status: 'running', completed_items: 0, total_items: 2, summary_code: null },
+  ));
+});

@@ -1,6 +1,17 @@
 export type EventChannelState = 'ready' | 'unavailable';
 export type OperationStatusUnlisten = () => void | Promise<void>;
 
+function notifyStateSafely(
+  onState: (state: EventChannelState) => void,
+  state: EventChannelState,
+): void {
+  try {
+    onState(state);
+  } catch {
+    // 观察者异常不得逃逸到 promise 链或改变 listener 生命周期。
+  }
+}
+
 function releaseSafely(release: OperationStatusUnlisten): void {
   try {
     void Promise.resolve(release()).catch(() => undefined);
@@ -23,10 +34,10 @@ export function superviseOperationStatusListener(
         return;
       }
       release = registeredRelease;
-      onState('ready');
+      notifyStateSafely(onState, 'ready');
     },
     () => {
-      if (!disposed) onState('unavailable');
+      if (!disposed) notifyStateSafely(onState, 'unavailable');
     },
   );
 
