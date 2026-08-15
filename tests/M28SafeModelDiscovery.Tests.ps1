@@ -30,7 +30,7 @@ Assert-True ($adapter -match 'AUTH_DOCUMENT_MAXIMUM_BYTES' -and $adapter -match 
 Assert-True ($infrastructure -match 'ProxyMode::Disabled' -and $infrastructure -match 'RedirectMode::Disabled' -and $infrastructure -match 'connect_addr') 'HTTP adapter 禁代理/重定向并固定审批地址'
 Assert-True ($infrastructure -match 'Zeroizing' -and $infrastructure -match 'Authorization: Bearer') 'Authorization 请求缓冲显式 zeroize'
 Assert-True ($infrastructure -match 'SensitiveChunkOutput' -and $infrastructure -match 'try_reserve' -and $infrastructure -match 'decoded_prefix_zeroizes_during_unwind') 'chunked 中间正文覆盖错误、allocation 与 unwind 清零'
-Assert-True ($application -match 'PublishDisposition' -and $application -match 'cancellation\.complete\(\)' -and $application -match 'probe_barriers_linearize') 'probe cancellation 使用原子 publish CAS 与 barrier 竞态合同'
+Assert-True ($application -match 'fn publish_terminal' -and $application -match 'PublishDisposition::AlreadyPublished => Err\(DiscoveryErrorCode::Internal\)' -and $application -match 'error_publish_and_cancel_races_have_one_terminal_winner' -and $application -match 'two_concurrent_calls_share_at_most_one_business_result') 'probe/discover 的成功、错误与取消共享一次性原子 terminal publish 合同'
 Assert-True ($integration -match 'mixed_allowed_and_denied' -and $integration -match 'redirect' -and $integration -match 'chunked' -and $integration -match 'slowloris' -and $integration -match 'secret_canary') '集成测试覆盖 DNS、redirect、size/timeout 与 secret canary'
 Assert-True ($manifest -match 'native-tls\s*=\s*\{[^}]*version\s*=\s*"=0\.2\.18"[^}]*default-features\s*=\s*false') 'TLS 依赖精确锁定且不启用 vendored/invalid-cert feature'
 

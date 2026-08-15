@@ -147,6 +147,8 @@ pub enum AuthorizationParseError {
 
 pub trait CancellationProbe: Send + Sync {
     fn is_cancelled(&self) -> bool;
+    fn is_completed(&self) -> bool;
+    fn cancel(&self) -> CancelDisposition;
     fn complete(&self) -> PublishDisposition;
 }
 
@@ -154,6 +156,11 @@ pub trait CancellationProbe: Send + Sync {
 pub struct CancellationController {
     state: Arc<AtomicU8>,
 }
+
+const OPERATION_RUNNING: u8 = 0;
+const CANCELLATION_REQUESTED: u8 = 1;
+const OPERATION_COMPLETED: u8 = 2;
+const CANCELLATION_DELIVERED: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancelDisposition {
@@ -179,29 +186,43 @@ impl CancellationController {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(0)),
+            state: Arc::new(AtomicU8::new(OPERATION_RUNNING)),
         }
     }
 
     pub fn cancel(&self) -> CancelDisposition {
-        match self
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        {
+        match self.state.compare_exchange(
+            OPERATION_RUNNING,
+            CANCELLATION_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => CancelDisposition::Cancelled,
-            Err(1) => CancelDisposition::AlreadyCancelled,
+            Err(CANCELLATION_REQUESTED | CANCELLATION_DELIVERED) => {
+                CancelDisposition::AlreadyCancelled
+            }
             Err(_) => CancelDisposition::TooLate,
         }
     }
 
     #[must_use]
     pub fn complete(&self) -> PublishDisposition {
-        match self
-            .state
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-        {
+        match self.state.compare_exchange(
+            OPERATION_RUNNING,
+            OPERATION_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => PublishDisposition::Published,
-            Err(1) => PublishDisposition::Cancelled,
+            Err(CANCELLATION_REQUESTED) => match self.state.compare_exchange(
+                CANCELLATION_REQUESTED,
+                CANCELLATION_DELIVERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => PublishDisposition::Cancelled,
+                Err(_) => PublishDisposition::AlreadyPublished,
+            },
             Err(_) => PublishDisposition::AlreadyPublished,
         }
     }
@@ -209,7 +230,21 @@ impl CancellationController {
 
 impl CancellationProbe for CancellationController {
     fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == 1
+        matches!(
+            self.state.load(Ordering::Acquire),
+            CANCELLATION_REQUESTED | CANCELLATION_DELIVERED
+        )
+    }
+
+    fn is_completed(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            OPERATION_COMPLETED | CANCELLATION_DELIVERED
+        )
+    }
+
+    fn cancel(&self) -> CancelDisposition {
+        CancellationController::cancel(self)
     }
 
     fn complete(&self) -> PublishDisposition {
@@ -222,6 +257,14 @@ pub struct NeverCancelled;
 impl CancellationProbe for NeverCancelled {
     fn is_cancelled(&self) -> bool {
         false
+    }
+
+    fn is_completed(&self) -> bool {
+        false
+    }
+
+    fn cancel(&self) -> CancelDisposition {
+        CancelDisposition::Cancelled
     }
 
     fn complete(&self) -> PublishDisposition {
@@ -463,40 +506,35 @@ where
         input: &ProbeConnectionInput,
         cancellation: &dyn CancellationProbe,
     ) -> Result<ProbeConnectionOutcome, DiscoveryErrorCode> {
-        let response = match self.execute(
-            input.service_version,
-            &input.identity_id,
-            &input.credential_ref_id,
-            input.expected_identity_version,
-            input.endpoint_policy,
-            &input.operation_id,
-            cancellation,
-        )? {
-            Some(response) => response,
-            None => return Ok(ProbeConnectionOutcome::Cancelled),
-        };
-        if cancellation.is_cancelled() {
-            return Ok(ProbeConnectionOutcome::Cancelled);
+        if cancellation.is_completed() {
+            return Err(DiscoveryErrorCode::Internal);
         }
-        validate_status(response.status())?;
-        if cancellation.is_cancelled() {
-            return Ok(ProbeConnectionOutcome::Cancelled);
-        }
-        let _ = parse_models(
-            response.body(),
-            self.limits.maximum_model_count,
-            self.limits.maximum_json_depth,
-        )?;
-        if cancellation.is_cancelled() {
-            return Ok(ProbeConnectionOutcome::Cancelled);
-        }
-        match cancellation.complete() {
-            PublishDisposition::Cancelled => Ok(ProbeConnectionOutcome::Cancelled),
-            PublishDisposition::Published | PublishDisposition::AlreadyPublished => {
-                Ok(ProbeConnectionOutcome::Reachable(ReachableSummary {
-                    api_compatible: true,
-                }))
-            }
+        let pending = (|| {
+            let response = self.execute(
+                input.service_version,
+                &input.identity_id,
+                &input.credential_ref_id,
+                input.expected_identity_version,
+                input.endpoint_policy,
+                &input.operation_id,
+                cancellation,
+            )?;
+            check_cancelled(cancellation)?;
+            validate_status(response.status())?;
+            check_cancelled(cancellation)?;
+            let _ = parse_models(
+                response.body(),
+                self.limits.maximum_model_count,
+                self.limits.maximum_json_depth,
+            )?;
+            check_cancelled(cancellation)?;
+            Ok(ReachableSummary {
+                api_compatible: true,
+            })
+        })();
+        match publish_terminal(cancellation, pending)? {
+            Some(summary) => Ok(ProbeConnectionOutcome::Reachable(summary)),
+            None => Ok(ProbeConnectionOutcome::Cancelled),
         }
     }
 
@@ -505,35 +543,33 @@ where
         input: &DiscoverModelsInput,
         cancellation: &dyn CancellationProbe,
     ) -> Result<DiscoverModelsOutcome, DiscoveryErrorCode> {
-        let response = match self.execute(
-            input.service_version,
-            &input.identity_id,
-            &input.credential_ref_id,
-            input.expected_identity_version,
-            input.endpoint_policy,
-            &input.operation_id,
-            cancellation,
-        )? {
-            Some(response) => response,
-            None => return Ok(DiscoverModelsOutcome::Cancelled),
-        };
-        validate_status(response.status())?;
-        if cancellation.is_cancelled() {
-            return Ok(DiscoverModelsOutcome::Cancelled);
+        if cancellation.is_completed() {
+            return Err(DiscoveryErrorCode::Internal);
         }
-        let models = parse_models(
-            response.body(),
-            self.limits.maximum_model_count,
-            self.limits.maximum_json_depth,
-        )?;
-        if cancellation.is_cancelled() {
-            return Ok(DiscoverModelsOutcome::Cancelled);
-        }
-        match cancellation.complete() {
-            PublishDisposition::Cancelled => Ok(DiscoverModelsOutcome::Cancelled),
-            PublishDisposition::Published | PublishDisposition::AlreadyPublished => {
-                Ok(DiscoverModelsOutcome::Models(models))
-            }
+        let pending = (|| {
+            let response = self.execute(
+                input.service_version,
+                &input.identity_id,
+                &input.credential_ref_id,
+                input.expected_identity_version,
+                input.endpoint_policy,
+                &input.operation_id,
+                cancellation,
+            )?;
+            check_cancelled(cancellation)?;
+            validate_status(response.status())?;
+            check_cancelled(cancellation)?;
+            let models = parse_models(
+                response.body(),
+                self.limits.maximum_model_count,
+                self.limits.maximum_json_depth,
+            )?;
+            check_cancelled(cancellation)?;
+            Ok(models)
+        })();
+        match publish_terminal(cancellation, pending)? {
+            Some(models) => Ok(DiscoverModelsOutcome::Models(models)),
+            None => Ok(DiscoverModelsOutcome::Cancelled),
         }
     }
 
@@ -547,13 +583,11 @@ where
         endpoint_policy: EndpointPolicy,
         operation_id: &str,
         cancellation: &dyn CancellationProbe,
-    ) -> Result<Option<TransportResponse>, DiscoveryErrorCode> {
+    ) -> Result<TransportResponse, DiscoveryErrorCode> {
         if service_version != M28_SERVICE_VERSION || !valid_operation_id(operation_id) {
             return Err(DiscoveryErrorCode::Validation);
         }
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
+        check_cancelled(cancellation)?;
         let identity = self
             .repository
             .get_runtime_identity(identity_id)
@@ -580,18 +614,11 @@ where
         let addresses = if let Some(address) = endpoint.literal_ip() {
             vec![address]
         } else {
-            match self
-                .resolver
+            self.resolver
                 .resolve(endpoint.host(), endpoint.port(), deadline, cancellation)
-            {
-                Ok(addresses) => addresses,
-                Err(ResolverErrorCode::Cancelled) => return Ok(None),
-                Err(error) => return Err(map_resolver_error(error)),
-            }
+                .map_err(map_resolver_error)?
         };
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
+        check_cancelled(cancellation)?;
         let target = ApprovedHttpTarget::new(endpoint, addresses, self.limits)
             .map_err(|_| DiscoveryErrorCode::Forbidden)?;
 
@@ -615,17 +642,12 @@ where
             return Err(map_auth_error(error));
         }
         let mut authorization = capture.bytes.ok_or(DiscoveryErrorCode::AuthRequired)?;
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        let response = match self
+        check_cancelled(cancellation)?;
+        let response = self
             .transport
             .get_models(&target, &mut authorization, cancellation)
-        {
-            Ok(response) => response,
-            Err(TransportErrorCode::Cancelled) => return Ok(None),
-            Err(error) => return Err(map_transport_error(error)),
-        };
+            .map_err(map_transport_error)?;
+        check_cancelled(cancellation)?;
         let current_identity = self
             .repository
             .get_runtime_identity(identity_id)
@@ -639,7 +661,36 @@ where
         if current_identity != identity || current_reference != reference {
             return Err(DiscoveryErrorCode::Conflict);
         }
-        Ok(Some(response))
+        Ok(response)
+    }
+}
+
+fn check_cancelled(cancellation: &dyn CancellationProbe) -> Result<(), DiscoveryErrorCode> {
+    if cancellation.is_cancelled() {
+        Err(DiscoveryErrorCode::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn publish_terminal<T>(
+    cancellation: &dyn CancellationProbe,
+    pending: Result<T, DiscoveryErrorCode>,
+) -> Result<Option<T>, DiscoveryErrorCode> {
+    // 不捕获不可恢复 panic；unwind 仍由各 Zeroizing owner 清理秘密，调用方须丢弃该 controller。
+    let pending_cancelled = pending.as_ref().err() == Some(&DiscoveryErrorCode::Cancelled);
+    if pending_cancelled && !cancellation.is_cancelled() {
+        match cancellation.cancel() {
+            CancelDisposition::Cancelled | CancelDisposition::AlreadyCancelled => {}
+            CancelDisposition::TooLate => return Err(DiscoveryErrorCode::Internal),
+        }
+    }
+
+    match cancellation.complete() {
+        PublishDisposition::Published if pending_cancelled => Ok(None),
+        PublishDisposition::Published => pending.map(Some),
+        PublishDisposition::Cancelled => Ok(None),
+        PublishDisposition::AlreadyPublished => Err(DiscoveryErrorCode::Internal),
     }
 }
 
@@ -1223,6 +1274,14 @@ mod tests {
         let cancellation = CancellationController::new();
         assert_eq!(cancellation.cancel(), CancelDisposition::Cancelled);
         assert_eq!(cancellation.cancel(), CancelDisposition::AlreadyCancelled);
+        assert_eq!(
+            cancellation.complete(),
+            super::PublishDisposition::Cancelled
+        );
+        assert_eq!(
+            cancellation.complete(),
+            super::PublishDisposition::AlreadyPublished
+        );
         let completed = CancellationController::new();
         assert_eq!(completed.complete(), super::PublishDisposition::Published);
         assert_eq!(completed.cancel(), CancelDisposition::TooLate);
@@ -1273,7 +1332,7 @@ mod service_tests {
     use std::{
         cell::{Cell, RefCell},
         net::{IpAddr, Ipv4Addr},
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::Instant,
     };
@@ -1409,6 +1468,22 @@ mod service_tests {
         rotate: Option<&'a FakeRepository>,
         cancel_on_return: Option<CancellationController>,
         return_barrier: Option<Arc<Barrier>>,
+        failure: Option<TransportErrorCode>,
+        status: u16,
+        body: &'static [u8],
+    }
+    impl FakeTransport<'_> {
+        fn successful() -> Self {
+            Self {
+                calls: Cell::new(0),
+                rotate: None,
+                cancel_on_return: None,
+                return_barrier: None,
+                failure: None,
+                status: 200,
+                body: br#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#,
+            }
+        }
     }
     impl ApprovedHttpTransport for FakeTransport<'_> {
         fn get_models(
@@ -1433,15 +1508,15 @@ mod service_tests {
             if let Some(cancellation) = &self.cancel_on_return {
                 let _ = cancellation.cancel();
             }
-            let response = TransportResponse::new(
-                200,
-                br#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#.to_vec(),
-            );
             if let Some(barrier) = &self.return_barrier {
                 barrier.wait();
                 barrier.wait();
             }
-            Ok(response)
+            if let Some(error) = self.failure {
+                Err(error)
+            } else {
+                Ok(TransportResponse::new(self.status, self.body.to_vec()))
+            }
         }
     }
     fn fixture() -> (FakeRepository, FakeStore, DiscoverModelsInput) {
@@ -1493,6 +1568,7 @@ mod service_tests {
             rotate: None,
             cancel_on_return: None,
             return_barrier: None,
+            ..FakeTransport::successful()
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1524,6 +1600,7 @@ mod service_tests {
             rotate: None,
             cancel_on_return: None,
             return_barrier: None,
+            ..FakeTransport::successful()
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1543,6 +1620,7 @@ mod service_tests {
             rotate: Some(&repository),
             cancel_on_return: None,
             return_barrier: None,
+            ..FakeTransport::successful()
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1575,6 +1653,7 @@ mod service_tests {
             rotate: None,
             cancel_on_return: Some(cancellation.clone()),
             return_barrier: None,
+            ..FakeTransport::successful()
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1594,6 +1673,7 @@ mod service_tests {
             rotate: None,
             cancel_on_return: None,
             return_barrier: None,
+            ..FakeTransport::successful()
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1609,6 +1689,442 @@ mod service_tests {
         assert_eq!(late.cancel(), super::CancelDisposition::TooLate);
     }
 
+    #[test]
+    fn business_error_claims_terminal_before_late_cancel() {
+        let (repository, store, mut input) = fixture();
+        input.operation_id.clear();
+        let cancellation = CancellationController::new();
+        let mut transport = FakeTransport {
+            calls: Cell::new(0),
+            rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
+            ..FakeTransport::successful()
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+
+        assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Err(DiscoveryErrorCode::Validation)
+        );
+        assert_eq!(cancellation.cancel(), super::CancelDisposition::TooLate);
+
+        let (repository, store, input) = fixture();
+        let mut probe = probe_from(&input);
+        probe.operation_id.clear();
+        let probe_cancellation = CancellationController::new();
+        let mut transport = FakeTransport::successful();
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.probe_connection(&probe, &probe_cancellation),
+            Err(DiscoveryErrorCode::Validation)
+        );
+        assert_eq!(
+            probe_cancellation.cancel(),
+            super::CancelDisposition::TooLate
+        );
+    }
+
+    #[test]
+    fn cancel_before_validation_wins_the_only_terminal_result() {
+        let (repository, store, mut input) = fixture();
+        input.operation_id.clear();
+        let cancellation = CancellationController::new();
+        assert_eq!(cancellation.cancel(), super::CancelDisposition::Cancelled);
+        let mut transport = FakeTransport {
+            calls: Cell::new(0),
+            rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
+            ..FakeTransport::successful()
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+
+        assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Ok(DiscoverModelsOutcome::Cancelled)
+        );
+        assert_eq!(
+            cancellation.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
+    }
+
+    #[test]
+    fn sequential_controller_reuse_fails_closed_without_second_payload() {
+        let (repository, store, input) = fixture();
+        let cancellation = CancellationController::new();
+        let mut transport = FakeTransport {
+            calls: Cell::new(0),
+            rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
+            ..FakeTransport::successful()
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+
+        assert!(matches!(
+            service.discover_models(&input, &cancellation),
+            Ok(DiscoverModelsOutcome::Models(_))
+        ));
+        assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(transport.calls.get(), 1);
+        assert_eq!(cancellation.cancel(), super::CancelDisposition::TooLate);
+    }
+
+    #[test]
+    fn probe_and_discover_share_success_and_cancel_terminal_rules() {
+        let (repository, store, input) = fixture();
+        let probe = probe_from(&input);
+
+        let cancelled_probe = CancellationController::new();
+        assert_eq!(
+            cancelled_probe.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        let mut transport = FakeTransport::successful();
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.probe_connection(&probe, &cancelled_probe),
+            Ok(super::ProbeConnectionOutcome::Cancelled)
+        );
+        assert_eq!(
+            cancelled_probe.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
+
+        let cancelled_discovery = CancellationController::new();
+        assert_eq!(
+            cancelled_discovery.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        let mut transport = FakeTransport::successful();
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.discover_models(&input, &cancelled_discovery),
+            Ok(DiscoverModelsOutcome::Cancelled)
+        );
+
+        let completed_discovery = CancellationController::new();
+        let mut transport = FakeTransport::successful();
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert!(matches!(
+            service.discover_models(&input, &completed_discovery),
+            Ok(DiscoverModelsOutcome::Models(_))
+        ));
+        assert_eq!(
+            completed_discovery.cancel(),
+            super::CancelDisposition::TooLate
+        );
+    }
+
+    #[test]
+    fn every_business_error_category_claims_a_terminal_result() {
+        fn run(
+            mutate_input: impl FnOnce(&mut DiscoverModelsInput),
+            mutate_transport: impl FnOnce(&mut FakeTransport<'_>),
+            expected: DiscoveryErrorCode,
+        ) {
+            let (repository, store, mut input) = fixture();
+            mutate_input(&mut input);
+            let cancellation = CancellationController::new();
+            let mut transport = FakeTransport::successful();
+            mutate_transport(&mut transport);
+            let mut service = SafeModelDiscoveryService::new(
+                &repository,
+                &store,
+                &FakeResolver,
+                &FakeParser,
+                &mut transport,
+            );
+            assert_eq!(
+                service.discover_models(&input, &cancellation),
+                Err(expected)
+            );
+            assert_eq!(cancellation.cancel(), super::CancelDisposition::TooLate);
+        }
+
+        run(
+            |input| input.operation_id.clear(),
+            |_| {},
+            DiscoveryErrorCode::Validation,
+        );
+        run(
+            |input| input.expected_identity_version = EntityVersion::new(2).unwrap(),
+            |_| {},
+            DiscoveryErrorCode::Conflict,
+        );
+        run(
+            |input| {
+                input.identity_id =
+                    IdentityId::parse("33333333-3333-3333-3333-333333333333").unwrap();
+            },
+            |_| {},
+            DiscoveryErrorCode::NotFound,
+        );
+        run(
+            |_| {},
+            |transport| transport.failure = Some(TransportErrorCode::Timeout),
+            DiscoveryErrorCode::Timeout,
+        );
+        run(
+            |_| {},
+            |transport| transport.status = 401,
+            DiscoveryErrorCode::AuthRequired,
+        );
+        run(
+            |_| {},
+            |transport| transport.body = br#"{"data":["#,
+            DiscoveryErrorCode::InvalidResponse,
+        );
+        run(
+            |_| {},
+            |transport| transport.body = br#"{"data":[{"id":"../credential/token"}]}"#,
+            DiscoveryErrorCode::InvalidResponse,
+        );
+    }
+
+    #[test]
+    fn lower_layer_cancel_claims_cancelled_terminal_and_cannot_be_republished() {
+        let (repository, store, input) = fixture();
+        let cancellation = CancellationController::new();
+        let mut transport = FakeTransport {
+            failure: Some(TransportErrorCode::Cancelled),
+            ..FakeTransport::successful()
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Ok(DiscoverModelsOutcome::Cancelled)
+        );
+        assert_eq!(transport.calls.get(), 1);
+        assert_eq!(
+            cancellation.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
+
+        let mut transport = FakeTransport::successful();
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(transport.calls.get(), 0);
+    }
+
+    #[test]
+    fn error_publish_and_cancel_races_have_one_terminal_winner() {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let completed = CancellationController::new();
+        let worker_controller = completed.clone();
+        let error_worker = thread::spawn(move || {
+            let (repository, store, mut input) = fixture();
+            input.operation_id.clear();
+            let mut transport = FakeTransport::successful();
+            let mut service = SafeModelDiscoveryService::new(
+                &repository,
+                &store,
+                &FakeResolver,
+                &FakeParser,
+                &mut transport,
+            );
+            let result = service.discover_models(&input, &worker_controller);
+            result_tx.send(result).unwrap();
+        });
+        assert_eq!(
+            result_rx.recv().unwrap(),
+            Err(DiscoveryErrorCode::Validation)
+        );
+        assert_eq!(completed.cancel(), super::CancelDisposition::TooLate);
+        error_worker.join().unwrap();
+
+        let publish_barrier = Arc::new(Barrier::new(2));
+        let publish_gate = Arc::new(PublishBarrierGate {
+            controller: CancellationController::new(),
+            barrier: publish_barrier.clone(),
+        });
+        let worker_gate = publish_gate.clone();
+        let cancelled_worker = thread::spawn(move || {
+            let (repository, store, input) = fixture();
+            let mut transport = FakeTransport {
+                status: 401,
+                ..FakeTransport::successful()
+            };
+            let mut service = SafeModelDiscoveryService::new(
+                &repository,
+                &store,
+                &FakeResolver,
+                &FakeParser,
+                &mut transport,
+            );
+            service.discover_models(&input, worker_gate.as_ref())
+        });
+        publish_barrier.wait();
+        assert_eq!(
+            publish_gate.controller.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        publish_barrier.wait();
+        assert_eq!(
+            cancelled_worker.join().unwrap(),
+            Ok(DiscoverModelsOutcome::Cancelled)
+        );
+        assert_eq!(
+            publish_gate.controller.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
+    }
+
+    #[test]
+    fn two_concurrent_calls_share_at_most_one_business_result() {
+        let return_barrier = Arc::new(Barrier::new(2));
+        let cancellation = CancellationController::new();
+        let workers = (0..2)
+            .map(|_| {
+                let worker_barrier = return_barrier.clone();
+                let worker_cancellation = cancellation.clone();
+                thread::spawn(move || {
+                    let (repository, store, input) = fixture();
+                    let mut transport = FakeTransport {
+                        return_barrier: Some(worker_barrier),
+                        ..FakeTransport::successful()
+                    };
+                    let mut service = SafeModelDiscoveryService::new(
+                        &repository,
+                        &store,
+                        &FakeResolver,
+                        &FakeParser,
+                        &mut transport,
+                    );
+                    service.discover_models(&input, &worker_cancellation)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(DiscoverModelsOutcome::Models(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(DiscoveryErrorCode::Internal))
+                .count(),
+            1
+        );
+        assert_eq!(cancellation.cancel(), super::CancelDisposition::TooLate);
+
+        let cancel_barrier = Arc::new(Barrier::new(2));
+        let cancelled_gate = Arc::new(PublishBarrierGate {
+            controller: CancellationController::new(),
+            barrier: cancel_barrier,
+        });
+        assert_eq!(
+            cancelled_gate.controller.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        let workers = (0..2)
+            .map(|_| {
+                let worker_gate = cancelled_gate.clone();
+                thread::spawn(move || {
+                    let (repository, store, mut input) = fixture();
+                    input.operation_id.clear();
+                    let mut transport = FakeTransport::successful();
+                    let mut service = SafeModelDiscoveryService::new(
+                        &repository,
+                        &store,
+                        &FakeResolver,
+                        &FakeParser,
+                        &mut transport,
+                    );
+                    service.discover_models(&input, worker_gate.as_ref())
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Ok(DiscoverModelsOutcome::Cancelled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(DiscoveryErrorCode::Internal))
+                .count(),
+            1
+        );
+    }
+
     struct PublishBarrierGate {
         controller: CancellationController,
         barrier: Arc<Barrier>,
@@ -1617,6 +2133,14 @@ mod service_tests {
     impl CancellationProbe for PublishBarrierGate {
         fn is_cancelled(&self) -> bool {
             self.controller.is_cancelled()
+        }
+
+        fn is_completed(&self) -> bool {
+            self.controller.is_completed()
+        }
+
+        fn cancel(&self) -> super::CancelDisposition {
+            self.controller.cancel()
         }
 
         fn complete(&self) -> PublishDisposition {
@@ -1651,6 +2175,7 @@ mod service_tests {
                 rotate: None,
                 cancel_on_return: None,
                 return_barrier: Some(worker_barrier),
+                ..FakeTransport::successful()
             };
             let mut service = SafeModelDiscoveryService::new(
                 &repository,
@@ -1686,6 +2211,7 @@ mod service_tests {
                 rotate: None,
                 cancel_on_return: None,
                 return_barrier: None,
+                ..FakeTransport::successful()
             };
             let mut service = SafeModelDiscoveryService::new(
                 &repository,
