@@ -25,9 +25,12 @@ Assert-True ($domain -match 'NormalizedEndpoint' -and $domain -match 'LoopbackDe
 Assert-True ($application -match 'ProbeConnectionInput' -and $application -match 'DiscoverModelsInput' -and $application -match 'M28_SERVICE_VERSION') 'application 分离 probe/discover 且输入带版本'
 Assert-True ($application -match 'trait DnsResolver' -and $application -match 'trait ApprovedHttpTransport' -and $application -match 'trait CredentialAuthorizationParser') 'DNS、固定目标 transport 与凭据解析均为显式 port'
 Assert-True ($application -match 'ResponseTooLarge' -and $application -match 'RateLimited' -and $application -match 'TlsFailure' -and $application -match 'CompatibilityProtected') '错误分类稳定且 secret-free'
-Assert-True ($adapter -match 'Zeroizing' -and $adapter -match 'access_token' -and $adapter -notmatch 'serde_json') '认证解析不经普通 String/serde Value 持有秘密'
+Assert-True ($adapter -match 'DecodedAuthorization' -and $adapter -match '\.zeroize\(\)' -and $adapter -match 'access_token' -and $adapter -notmatch 'serde_json') '认证解析使用显式 Drop zeroize owner，不经普通 String/serde Value 持有秘密'
+Assert-True ($adapter -match 'AUTH_DOCUMENT_MAXIMUM_BYTES' -and $adapter -match 'AUTH_JSON_MAXIMUM_DEPTH') 'credential parser 固定 1 MiB 与 JSON depth 预算'
 Assert-True ($infrastructure -match 'ProxyMode::Disabled' -and $infrastructure -match 'RedirectMode::Disabled' -and $infrastructure -match 'connect_addr') 'HTTP adapter 禁代理/重定向并固定审批地址'
 Assert-True ($infrastructure -match 'Zeroizing' -and $infrastructure -match 'Authorization: Bearer') 'Authorization 请求缓冲显式 zeroize'
+Assert-True ($infrastructure -match 'SensitiveChunkOutput' -and $infrastructure -match 'try_reserve' -and $infrastructure -match 'decoded_prefix_zeroizes_during_unwind') 'chunked 中间正文覆盖错误、allocation 与 unwind 清零'
+Assert-True ($application -match 'PublishDisposition' -and $application -match 'cancellation\.complete\(\)' -and $application -match 'probe_barriers_linearize') 'probe cancellation 使用原子 publish CAS 与 barrier 竞态合同'
 Assert-True ($integration -match 'mixed_allowed_and_denied' -and $integration -match 'redirect' -and $integration -match 'chunked' -and $integration -match 'slowloris' -and $integration -match 'secret_canary') '集成测试覆盖 DNS、redirect、size/timeout 与 secret canary'
 Assert-True ($manifest -match 'native-tls\s*=\s*\{[^}]*version\s*=\s*"=0\.2\.18"[^}]*default-features\s*=\s*false') 'TLS 依赖精确锁定且不启用 vendored/invalid-cert feature'
 

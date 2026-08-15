@@ -328,7 +328,7 @@ fn read_response(
         if encoded.len() != length {
             return Err(TransportErrorCode::InvalidResponse);
         }
-        std::mem::take(&mut *encoded)
+        Zeroizing::new(std::mem::take(&mut *encoded))
     } else {
         while let ReadProgress::Data = read_once(
             stream,
@@ -337,9 +337,9 @@ fn read_response(
             deadline,
             cancellation,
         )? {}
-        std::mem::take(&mut *encoded)
+        Zeroizing::new(std::mem::take(&mut *encoded))
     };
-    Ok(TransportResponse::new(status, body))
+    Ok(TransportResponse::from_zeroizing_body(status, body))
 }
 
 fn parse_headers(header: &[u8]) -> Result<(u16, Option<usize>, bool), TransportErrorCode> {
@@ -411,9 +411,103 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn decode_chunked(encoded: &[u8], maximum: usize) -> Result<Option<Vec<u8>>, TransportErrorCode> {
+struct SensitiveChunkOutput {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    #[cfg(test)]
+    panic_after_extend: bool,
+    #[cfg(test)]
+    fail_reserve_after_extends: Option<usize>,
+    #[cfg(test)]
+    extend_count: usize,
+}
+
+impl SensitiveChunkOutput {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            #[cfg(test)]
+            observer: None,
+            #[cfg(test)]
+            panic_after_extend: false,
+            #[cfg(test)]
+            fail_reserve_after_extends: None,
+            #[cfg(test)]
+            extend_count: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn observed(
+        observer: std::rc::Rc<std::cell::Cell<bool>>,
+        panic_after_extend: bool,
+        fail_reserve_after_extends: Option<usize>,
+    ) -> Self {
+        Self {
+            bytes: Vec::new(),
+            observer: Some(observer),
+            panic_after_extend,
+            fail_reserve_after_extends,
+            extend_count: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn extend_from_slice(&mut self, value: &[u8]) -> Result<(), TransportErrorCode> {
+        #[cfg(test)]
+        if self
+            .fail_reserve_after_extends
+            .is_some_and(|limit| self.extend_count >= limit)
+        {
+            return Err(TransportErrorCode::ResponseTooLarge);
+        }
+        self.bytes
+            .try_reserve(value.len())
+            .map_err(|_| TransportErrorCode::ResponseTooLarge)?;
+        self.bytes.extend_from_slice(value);
+        #[cfg(test)]
+        {
+            self.extend_count += 1;
+            if self.panic_after_extend {
+                panic!("synthetic chunk decoder panic")
+            }
+        }
+        Ok(())
+    }
+
+    fn into_zeroizing(mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut self.bytes))
+    }
+}
+
+impl Drop for SensitiveChunkOutput {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.set(self.bytes.iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+fn decode_chunked(
+    encoded: &[u8],
+    maximum: usize,
+) -> Result<Option<Zeroizing<Vec<u8>>>, TransportErrorCode> {
+    decode_chunked_with_output(encoded, maximum, SensitiveChunkOutput::new())
+        .map(|output| output.map(SensitiveChunkOutput::into_zeroizing))
+}
+
+fn decode_chunked_with_output(
+    encoded: &[u8],
+    maximum: usize,
+    mut output: SensitiveChunkOutput,
+) -> Result<Option<SensitiveChunkOutput>, TransportErrorCode> {
     let mut position = 0;
-    let mut output = Vec::new();
     loop {
         let Some(line_end) = find_bytes(&encoded[position..], b"\r\n") else {
             return Ok(None);
@@ -457,7 +551,7 @@ fn decode_chunked(encoded: &[u8], maximum: usize) -> Result<Option<Vec<u8>>, Tra
         if encoded.get(end..end + 2) != Some(b"\r\n") {
             return Err(TransportErrorCode::InvalidResponse);
         }
-        output.extend_from_slice(&encoded[position..end]);
+        output.extend_from_slice(&encoded[position..end])?;
         position = end + 2;
     }
 }
@@ -544,5 +638,90 @@ fn map_io(error: &io::Error) -> TransportErrorCode {
         io::ErrorKind::TimedOut => TransportErrorCode::Timeout,
         io::ErrorKind::InvalidData => TransportErrorCode::InvalidResponse,
         _ => TransportErrorCode::NetworkUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod chunked_zeroize_tests {
+    use std::{
+        cell::Cell,
+        panic::{AssertUnwindSafe, catch_unwind},
+        rc::Rc,
+    };
+    use zeroize::Zeroizing;
+
+    use super::{SensitiveChunkOutput, decode_chunked, decode_chunked_with_output};
+
+    fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+
+    #[test]
+    fn decoded_chunk_owner_is_zeroizing() {
+        let decoded = decode_chunked(b"6\r\nSECRET\r\n0\r\n\r\n", 64)
+            .unwrap()
+            .unwrap();
+        assert_zeroizing(&decoded);
+    }
+
+    fn encoded_sensitive_prefix(suffix: &[u8]) -> Vec<u8> {
+        let sensitive = [b"sk-".as_slice(), b"SYNTHETIC_12345678901234567890"].concat();
+        let mut encoded = format!("{:x}\r\n", sensitive.len()).into_bytes();
+        encoded.extend_from_slice(&sensitive);
+        encoded.extend_from_slice(b"\r\n");
+        encoded.extend_from_slice(suffix);
+        encoded
+    }
+
+    #[test]
+    fn decoded_prefix_zeroizes_on_malformed_and_incomplete_followup() {
+        for (suffix, expected_error) in [(b"z\r\n".as_slice(), true), (b"4\r\nx".as_slice(), false)]
+        {
+            let observed = Rc::new(Cell::new(false));
+            let result = decode_chunked_with_output(
+                &encoded_sensitive_prefix(suffix),
+                1_024,
+                SensitiveChunkOutput::observed(observed.clone(), false, None),
+            );
+            if expected_error {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result, Ok(None)));
+            }
+            assert!(observed.get());
+        }
+    }
+
+    #[test]
+    fn decoded_prefix_zeroizes_during_unwind() {
+        let observed = Rc::new(Cell::new(false));
+        let observer = observed.clone();
+        let encoded = encoded_sensitive_prefix(b"0\r\n\r\n");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = decode_chunked_with_output(
+                &encoded,
+                1_024,
+                SensitiveChunkOutput::observed(observer, true, None),
+            );
+        }));
+        assert!(result.is_err());
+        assert!(observed.get());
+    }
+
+    #[test]
+    fn decoded_prefix_zeroizes_when_followup_allocation_fails() {
+        let observed = Rc::new(Cell::new(false));
+        let sensitive = [b"sk-".as_slice(), b"SYNTHETIC_12345678901234567890"].concat();
+        let mut encoded = format!("{:x}\r\n", sensitive.len()).into_bytes();
+        encoded.extend_from_slice(&sensitive);
+        encoded.extend_from_slice(b"\r\n4\r\nMORE\r\n0\r\n\r\n");
+        let result = decode_chunked_with_output(
+            &encoded,
+            1_024,
+            SensitiveChunkOutput::observed(observed.clone(), false, Some(1)),
+        );
+        assert!(matches!(
+            result,
+            Err(super::TransportErrorCode::ResponseTooLarge)
+        ));
+        assert!(observed.get());
     }
 }

@@ -38,12 +38,13 @@ enum Context {
 struct Parser<'a> {
     bytes: &'a [u8],
     position: usize,
+    maximum_depth: usize,
 }
 
 impl Parser<'_> {
     fn parse(mut self) -> Result<ObjectShape, CompatibilityReason> {
         self.ws();
-        let shape = self.object(Context::Root)?;
+        let shape = self.object(Context::Root, 1)?;
         self.ws();
         if self.position != self.bytes.len() {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
@@ -61,7 +62,14 @@ impl Parser<'_> {
         }
     }
 
-    fn object(&mut self, context: Context) -> Result<ObjectShape, CompatibilityReason> {
+    fn object(
+        &mut self,
+        context: Context,
+        depth: usize,
+    ) -> Result<ObjectShape, CompatibilityReason> {
+        if depth > self.maximum_depth {
+            return Err(CompatibilityReason::UnknownAuthenticationShape);
+        }
         if self.bytes.get(self.position) != Some(&b'{') {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
@@ -90,7 +98,7 @@ impl Parser<'_> {
                     shape.api_key = Some(self.nonempty_string_span()?)
                 }
                 (Context::Root, JsonField::Tokens) => {
-                    let tokens = self.object(Context::Tokens)?;
+                    let tokens = self.object(Context::Tokens, depth + 1)?;
                     shape.tokens = true;
                     shape.id_token = tokens.id_token;
                     shape.access_token = tokens.access_token;
@@ -107,7 +115,7 @@ impl Parser<'_> {
                 (Context::Tokens, JsonField::AccountId) => {
                     shape.account_id = self.nonempty_string()?
                 }
-                _ => self.value(Context::Other)?,
+                _ => self.value(Context::Other, depth + 1)?,
             }
             self.ws();
             match self.bytes.get(self.position) {
@@ -124,11 +132,11 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self, context: Context) -> Result<(), CompatibilityReason> {
+    fn value(&mut self, context: Context, depth: usize) -> Result<(), CompatibilityReason> {
         self.ws();
         match self.bytes.get(self.position) {
-            Some(b'{') => self.object(context).map(|_| ()),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(context, depth).map(|_| ()),
+            Some(b'[') => self.array(depth),
             Some(b'"') => self.skip_string(),
             Some(b't') => self.literal(b"true"),
             Some(b'f') => self.literal(b"false"),
@@ -138,7 +146,10 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self) -> Result<(), CompatibilityReason> {
+    fn array(&mut self, depth: usize) -> Result<(), CompatibilityReason> {
+        if depth > self.maximum_depth {
+            return Err(CompatibilityReason::UnknownAuthenticationShape);
+        }
         self.position += 1;
         self.ws();
         if self.bytes.get(self.position) == Some(&b']') {
@@ -146,7 +157,7 @@ impl Parser<'_> {
             return Ok(());
         }
         loop {
-            self.value(Context::Other)?;
+            self.value(Context::Other, depth + 1)?;
             self.ws();
             match self.bytes.get(self.position) {
                 Some(b',') => {
@@ -456,8 +467,14 @@ impl Parser<'_> {
 }
 
 pub fn classify(bytes: &[u8]) -> Result<(&'static str, &'static str), CompatibilityReason> {
+    const COMPATIBILITY_MAXIMUM_DEPTH: usize = 128;
     std::str::from_utf8(bytes).map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
-    let shape = Parser { bytes, position: 0 }.parse()?;
+    let shape = Parser {
+        bytes,
+        position: 0,
+        maximum_depth: COMPATIBILITY_MAXIMUM_DEPTH,
+    }
+    .parse()?;
     let api = shape.api_key.is_some();
     let oauth = shape.tokens
         && shape.id_token
@@ -476,9 +493,15 @@ pub fn classify(bytes: &[u8]) -> Result<(&'static str, &'static str), Compatibil
 
 pub(crate) fn authorization_span(
     bytes: &[u8],
+    maximum_depth: usize,
 ) -> Result<(&'static str, (usize, usize)), CompatibilityReason> {
     std::str::from_utf8(bytes).map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
-    let shape = (Parser { bytes, position: 0 }).parse()?;
+    let shape = (Parser {
+        bytes,
+        position: 0,
+        maximum_depth,
+    })
+    .parse()?;
     let oauth = shape.tokens
         && shape.id_token
         && shape.access_token.is_some()

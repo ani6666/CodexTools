@@ -147,6 +147,7 @@ pub enum AuthorizationParseError {
 
 pub trait CancellationProbe: Send + Sync {
     fn is_cancelled(&self) -> bool;
+    fn complete(&self) -> PublishDisposition;
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +160,13 @@ pub enum CancelDisposition {
     Cancelled,
     AlreadyCancelled,
     TooLate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishDisposition {
+    Published,
+    Cancelled,
+    AlreadyPublished,
 }
 
 impl Default for CancellationController {
@@ -186,16 +194,26 @@ impl CancellationController {
         }
     }
 
-    pub fn complete(&self) {
-        let _ = self
+    #[must_use]
+    pub fn complete(&self) -> PublishDisposition {
+        match self
             .state
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => PublishDisposition::Published,
+            Err(1) => PublishDisposition::Cancelled,
+            Err(_) => PublishDisposition::AlreadyPublished,
+        }
     }
 }
 
 impl CancellationProbe for CancellationController {
     fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == 1
+    }
+
+    fn complete(&self) -> PublishDisposition {
+        CancellationController::complete(self)
     }
 }
 
@@ -204,6 +222,10 @@ pub struct NeverCancelled;
 impl CancellationProbe for NeverCancelled {
     fn is_cancelled(&self) -> bool {
         false
+    }
+
+    fn complete(&self) -> PublishDisposition {
+        PublishDisposition::Published
     }
 }
 
@@ -354,6 +376,11 @@ impl TransportResponse {
             body: Zeroizing::new(body),
         }
     }
+
+    #[must_use]
+    pub fn from_zeroizing_body(status: u16, body: Zeroizing<Vec<u8>>) -> Self {
+        Self { status, body }
+    }
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.status
@@ -448,15 +475,29 @@ where
             Some(response) => response,
             None => return Ok(ProbeConnectionOutcome::Cancelled),
         };
+        if cancellation.is_cancelled() {
+            return Ok(ProbeConnectionOutcome::Cancelled);
+        }
         validate_status(response.status())?;
+        if cancellation.is_cancelled() {
+            return Ok(ProbeConnectionOutcome::Cancelled);
+        }
         let _ = parse_models(
             response.body(),
             self.limits.maximum_model_count,
             self.limits.maximum_json_depth,
         )?;
-        Ok(ProbeConnectionOutcome::Reachable(ReachableSummary {
-            api_compatible: true,
-        }))
+        if cancellation.is_cancelled() {
+            return Ok(ProbeConnectionOutcome::Cancelled);
+        }
+        match cancellation.complete() {
+            PublishDisposition::Cancelled => Ok(ProbeConnectionOutcome::Cancelled),
+            PublishDisposition::Published | PublishDisposition::AlreadyPublished => {
+                Ok(ProbeConnectionOutcome::Reachable(ReachableSummary {
+                    api_compatible: true,
+                }))
+            }
+        }
     }
 
     pub fn discover_models(
@@ -488,7 +529,12 @@ where
         if cancellation.is_cancelled() {
             return Ok(DiscoverModelsOutcome::Cancelled);
         }
-        Ok(DiscoverModelsOutcome::Models(models))
+        match cancellation.complete() {
+            PublishDisposition::Cancelled => Ok(DiscoverModelsOutcome::Cancelled),
+            PublishDisposition::Published | PublishDisposition::AlreadyPublished => {
+                Ok(DiscoverModelsOutcome::Models(models))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1114,8 +1160,8 @@ impl ModelJsonParser<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovedHttpTarget, CancelDisposition, CancellationController, DiscoveryErrorCode,
-        NetworkLimits, parse_models, validate_status,
+        ApprovedHttpTarget, AuthorizationParseError, CancelDisposition, CancellationController,
+        DiscoveryErrorCode, NetworkLimits, map_auth_error, parse_models, validate_status,
     };
     use codex_domain::{EndpointPolicy, NormalizedEndpoint};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1178,8 +1224,12 @@ mod tests {
         assert_eq!(cancellation.cancel(), CancelDisposition::Cancelled);
         assert_eq!(cancellation.cancel(), CancelDisposition::AlreadyCancelled);
         let completed = CancellationController::new();
-        completed.complete();
+        assert_eq!(completed.complete(), super::PublishDisposition::Published);
         assert_eq!(completed.cancel(), CancelDisposition::TooLate);
+        assert_eq!(
+            map_auth_error(AuthorizationParseError::Invalid),
+            DiscoveryErrorCode::CompatibilityProtected
+        );
     }
 
     #[test]
@@ -1205,9 +1255,10 @@ mod tests {
 mod service_tests {
     use super::{
         ApprovedHttpTarget, ApprovedHttpTransport, AuthorizationConsumer, AuthorizationParseError,
-        CancellationProbe, CredentialAuthorizationParser, DiscoverModelsInput,
-        DiscoverModelsOutcome, DiscoveryErrorCode, DnsResolver, NeverCancelled, ResolverErrorCode,
-        SafeModelDiscoveryService, TransportErrorCode, TransportResponse,
+        CancellationController, CancellationProbe, CredentialAuthorizationParser,
+        DiscoverModelsInput, DiscoverModelsOutcome, DiscoveryErrorCode, DnsResolver,
+        NeverCancelled, PublishDisposition, ResolverErrorCode, SafeModelDiscoveryService,
+        TransportErrorCode, TransportResponse,
     };
     use crate::{
         CredentialEnvelopeBinding, CredentialReferenceRepository, CredentialStore,
@@ -1222,6 +1273,8 @@ mod service_tests {
     use std::{
         cell::{Cell, RefCell},
         net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Barrier},
+        thread,
         time::Instant,
     };
 
@@ -1354,6 +1407,8 @@ mod service_tests {
     struct FakeTransport<'a> {
         calls: Cell<usize>,
         rotate: Option<&'a FakeRepository>,
+        cancel_on_return: Option<CancellationController>,
+        return_barrier: Option<Arc<Barrier>>,
     }
     impl ApprovedHttpTransport for FakeTransport<'_> {
         fn get_models(
@@ -1375,10 +1430,18 @@ mod service_tests {
                     .unwrap();
                 repository.credential.replace(rotated);
             }
-            Ok(TransportResponse::new(
+            if let Some(cancellation) = &self.cancel_on_return {
+                let _ = cancellation.cancel();
+            }
+            let response = TransportResponse::new(
                 200,
                 br#"{"data":[{"id":"model-b"},{"id":"model-a"}]}"#.to_vec(),
-            ))
+            );
+            if let Some(barrier) = &self.return_barrier {
+                barrier.wait();
+                barrier.wait();
+            }
+            Ok(response)
         }
     }
     fn fixture() -> (FakeRepository, FakeStore, DiscoverModelsInput) {
@@ -1428,6 +1491,8 @@ mod service_tests {
         let mut transport = FakeTransport {
             calls: Cell::new(0),
             rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1457,6 +1522,8 @@ mod service_tests {
         let mut transport = FakeTransport {
             calls: Cell::new(0),
             rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1474,6 +1541,8 @@ mod service_tests {
         let mut rotating = FakeTransport {
             calls: Cell::new(0),
             rotate: Some(&repository),
+            cancel_on_return: None,
+            return_barrier: None,
         };
         let mut service = SafeModelDiscoveryService::new(
             &repository,
@@ -1487,5 +1556,155 @@ mod service_tests {
             Err(DiscoveryErrorCode::Conflict)
         );
         assert_eq!(rotating.calls.get(), 1);
+    }
+
+    #[test]
+    fn probe_cancellation_before_publish_wins_and_late_cancel_is_too_late() {
+        let (repository, store, input) = fixture();
+        let probe = super::ProbeConnectionInput {
+            service_version: input.service_version,
+            identity_id: input.identity_id.clone(),
+            credential_ref_id: input.credential_ref_id.clone(),
+            expected_identity_version: input.expected_identity_version,
+            endpoint_policy: input.endpoint_policy,
+            operation_id: "probe_operation".to_owned(),
+        };
+        let cancellation = CancellationController::new();
+        let mut transport = FakeTransport {
+            calls: Cell::new(0),
+            rotate: None,
+            cancel_on_return: Some(cancellation.clone()),
+            return_barrier: None,
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert_eq!(
+            service.probe_connection(&probe, &cancellation),
+            Ok(super::ProbeConnectionOutcome::Cancelled)
+        );
+
+        let late = CancellationController::new();
+        let mut transport = FakeTransport {
+            calls: Cell::new(0),
+            rotate: None,
+            cancel_on_return: None,
+            return_barrier: None,
+        };
+        let mut service = SafeModelDiscoveryService::new(
+            &repository,
+            &store,
+            &FakeResolver,
+            &FakeParser,
+            &mut transport,
+        );
+        assert!(matches!(
+            service.probe_connection(&probe, &late),
+            Ok(super::ProbeConnectionOutcome::Reachable(_))
+        ));
+        assert_eq!(late.cancel(), super::CancelDisposition::TooLate);
+    }
+
+    struct PublishBarrierGate {
+        controller: CancellationController,
+        barrier: Arc<Barrier>,
+    }
+
+    impl CancellationProbe for PublishBarrierGate {
+        fn is_cancelled(&self) -> bool {
+            self.controller.is_cancelled()
+        }
+
+        fn complete(&self) -> PublishDisposition {
+            self.barrier.wait();
+            self.barrier.wait();
+            self.controller.complete()
+        }
+    }
+
+    fn probe_from(input: &DiscoverModelsInput) -> super::ProbeConnectionInput {
+        super::ProbeConnectionInput {
+            service_version: input.service_version,
+            identity_id: input.identity_id.clone(),
+            credential_ref_id: input.credential_ref_id.clone(),
+            expected_identity_version: input.expected_identity_version,
+            endpoint_policy: input.endpoint_policy,
+            operation_id: "barrier_probe".to_owned(),
+        }
+    }
+
+    #[test]
+    fn probe_barriers_linearize_transport_return_parse_and_publish() {
+        let transport_barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = transport_barrier.clone();
+        let transport_cancel = CancellationController::new();
+        let worker_cancel = transport_cancel.clone();
+        let transport_worker = thread::spawn(move || {
+            let (repository, store, input) = fixture();
+            let probe = probe_from(&input);
+            let mut transport = FakeTransport {
+                calls: Cell::new(0),
+                rotate: None,
+                cancel_on_return: None,
+                return_barrier: Some(worker_barrier),
+            };
+            let mut service = SafeModelDiscoveryService::new(
+                &repository,
+                &store,
+                &FakeResolver,
+                &FakeParser,
+                &mut transport,
+            );
+            service.probe_connection(&probe, &worker_cancel)
+        });
+        transport_barrier.wait();
+        assert_eq!(
+            transport_cancel.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        transport_barrier.wait();
+        assert_eq!(
+            transport_worker.join().unwrap(),
+            Ok(super::ProbeConnectionOutcome::Cancelled)
+        );
+
+        let publish_barrier = Arc::new(Barrier::new(2));
+        let publish_gate = Arc::new(PublishBarrierGate {
+            controller: CancellationController::new(),
+            barrier: publish_barrier.clone(),
+        });
+        let worker_gate = publish_gate.clone();
+        let publish_worker = thread::spawn(move || {
+            let (repository, store, input) = fixture();
+            let probe = probe_from(&input);
+            let mut transport = FakeTransport {
+                calls: Cell::new(0),
+                rotate: None,
+                cancel_on_return: None,
+                return_barrier: None,
+            };
+            let mut service = SafeModelDiscoveryService::new(
+                &repository,
+                &store,
+                &FakeResolver,
+                &FakeParser,
+                &mut transport,
+            );
+            service.probe_connection(&probe, worker_gate.as_ref())
+        });
+        publish_barrier.wait();
+        assert_eq!(
+            publish_gate.controller.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        publish_barrier.wait();
+        assert_eq!(
+            publish_worker.join().unwrap(),
+            Ok(super::ProbeConnectionOutcome::Cancelled)
+        );
     }
 }
