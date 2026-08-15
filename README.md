@@ -64,6 +64,10 @@ credential reference/material 仍由 `CredentialService` owner + recovery journa
 
 M2.7 为已有身份补齐模型预设与默认绑定的 Rust-only 原子服务。application 使用分离、带版本的 create-and-bind/update-and-bind 输入和组合 repository port；local infrastructure 在一个 SQLite `Immediate` transaction 内复读 identity/preset、执行 preset 写入与 identity CAS，再一次提交。重复的同一请求稳定返回 `AlreadyApplied`，stale version、foreign preset、唯一名冲突和并发 loser 稳定返回 `Conflict`；提交确认丢失返回 `RecoveryRequired`。受管理的 preset name/model metadata 由 domain 验证并拒绝高置信秘密与路径形态。M3.3 只增加其 desktop facade/UI adapter，没有 schema migration、网络或 credential 边界变化。
 
+M2.8 提供 Rust-only 的显式连接探测与 OpenAI-compatible 模型候选发现核心，不增加 Tauri command、前端入口、启动联网或 schema migration。application 分离 `ProbeConnectionInput`/`DiscoverModelsInput`，用 expected identity version、credential reference 与 operation id 绑定请求；credential document 仅通过既有 `CredentialStore::read` 短借，API key 被复制到 `Zeroizing` buffer 后立即释放 store borrow，Authorization、响应原文和 endpoint 不进入公开 outcome、Debug 或错误。现有 OAuth bundle 缺少可验证 expiry，因此 M2.8 在联网前稳定返回 `compatibility_protected`，不会猜测 token 新鲜度。
+
+网络策略默认仅允许规范化 HTTPS/443 公网端点；显式 `LoopbackDevelopment` 仅接受 localhost/127.0.0.0/8/::1。DNS 返回的全部地址逐个复核，任一 private/link-local/metadata/CGNAT/multicast/unspecified/mapped IPv6/NAT64 等地址即整体拒绝。transport 直接连接审批后的 `SocketAddr` 并保留原 host 供 HTTP Host 与 TLS SNI/证书验证，不读取代理环境、不跟随 redirect，也不提供 invalid-certificate 开关。连接、读、总时限、header/body/model count/字段长度/JSON 深度均有上限，取消在 DNS/connect/TLS/read/parse 边界收敛。唯一新增生产依赖为精确锁定的 `native-tls` 0.2.18（MIT OR Apache-2.0，默认 features 为空；Windows 使用 Schannel）；未采用 `reqwest`/`ureq`/`hyper`，避免额外运行时、代理/redirect 默认面以及无法承诺清零的高层 header 副本。合同入口为 `pwsh -NoProfile -File .\tests\M28SafeModelDiscovery.Tests.ps1` 及对应 Rust focused tests。
+
 恢复快照终审修正后，v11 schema 期望值由 SQLite 直接执行仓库 migration 后读取，并通过 `pragma_table_xinfo`、`index_list/index_xinfo`、STRICT 状态、保留字符串/GLOB 内容的 SQL token 比较和回滚式约束行为矩阵共同审计；格式空白、注释和语句分号可等价变化，但 GLOB/string 语义篡改 fail closed。trigger 审计忽略注释与字符串字面量，只对真实跨表 INSERT/UPDATE/DELETE ledger 依赖和挂载在 ledger 上的 trigger 阻断。metadata 缺失时的破坏性 credential recovery 只有在 material reference、generation/binding、envelope hash 与解密后的 planned fingerprint 全部吻合后才删除，材料已不存在可幂等清理，替换 plaintext、stale ref/hash 或 quarantine 双重状态均保留并返回 recovery required。跨进程写锁先固定本地卷根，再使用 `NtCreateFile` 的 `RootDirectory` handle 逐组件相对、no-follow 打开；每级可由父句柄重开并核对 identity，因此同卷 DOS alias/SUBST 在逐组件间切换也不能跨越已固定父目录。任意祖先/final/lock reparse 都 fail closed，并阻止祖先与锁文件替换竞争。config 原文、TOML text/assignment value、规划输出和 `SwitchPlan` config 均使用 `Zeroizing` ownership，相关 Debug 只输出固定脱敏标记。不同受控根共享 credential 的并发 helper 只有在 repository/store 已打开并到达 owner/CAS 调用边界后才发出 barrier，测试只接受一个 Imported/AlreadyImported 与一个 Conflict，并精确核对最终 material/reference/identity/preset/patch/journal。rollback 工具嵌入 patch/manifest/entry-set trust anchor，逐组件拒绝 reparse，默认 dry-run；Apply 会先保存 durable journal 与 final backups，再做 tracked reverse 和 ignored 原子替换，失败自动补偿或保留机器可恢复状态。
 
 ## 核心方向
@@ -86,6 +90,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --all-targets
+pwsh -NoProfile -File .\tests\M28SafeModelDiscovery.Tests.ps1
+cargo test -p local-infrastructure --test m28_safe_model_discovery --all-features
 pwsh -NoProfile -File .\tests\M30DesktopSkeleton.Tests.ps1
 pwsh -NoProfile -File .\tests\M31ApplicationFacade.Tests.ps1
 pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! 只读取调用方显式提供的 Codex 目录，并只在内存中生成配置计划。
 
+mod auth;
 mod hash;
 mod json;
 mod toml;
@@ -19,6 +20,8 @@ use codex_domain::{
     ModelId, ProviderId, SchemaFingerprint, contains_high_confidence_secret_bytes,
 };
 use zeroize::{Zeroize, Zeroizing};
+
+pub use auth::CodexAuthorizationParser;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexAdapter;

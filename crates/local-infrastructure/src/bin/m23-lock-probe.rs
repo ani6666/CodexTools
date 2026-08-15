@@ -3,6 +3,7 @@ use std::{io, path::PathBuf, thread, time::Duration};
 use codex_adapter as _;
 use codex_domain::UnixMillis;
 use local_infrastructure::CrossProcessWriteLock;
+use native_tls as _;
 use rusqlite as _;
 use windows_platform as _;
 use zeroize as _;

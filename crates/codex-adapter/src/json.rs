@@ -20,10 +20,10 @@ enum JsonField {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ObjectShape {
-    api_key: bool,
+    api_key: Option<(usize, usize)>,
     tokens: bool,
     id_token: bool,
-    access_token: bool,
+    access_token: Option<(usize, usize)>,
     refresh_token: bool,
     account_id: bool,
 }
@@ -86,7 +86,9 @@ impl Parser<'_> {
             self.position += 1;
             self.ws();
             match (context, key.field) {
-                (Context::Root, JsonField::ApiKey) => shape.api_key = self.nonempty_string()?,
+                (Context::Root, JsonField::ApiKey) => {
+                    shape.api_key = Some(self.nonempty_string_span()?)
+                }
                 (Context::Root, JsonField::Tokens) => {
                     let tokens = self.object(Context::Tokens)?;
                     shape.tokens = true;
@@ -97,7 +99,7 @@ impl Parser<'_> {
                 }
                 (Context::Tokens, JsonField::IdToken) => shape.id_token = self.nonempty_string()?,
                 (Context::Tokens, JsonField::AccessToken) => {
-                    shape.access_token = self.nonempty_string()?
+                    shape.access_token = Some(self.nonempty_string_span()?)
                 }
                 (Context::Tokens, JsonField::RefreshToken) => {
                     shape.refresh_token = self.nonempty_string()?;
@@ -229,10 +231,15 @@ impl Parser<'_> {
     }
 
     fn nonempty_string(&mut self) -> Result<bool, CompatibilityReason> {
+        self.nonempty_string_span().map(|_| true)
+    }
+
+    fn nonempty_string_span(&mut self) -> Result<(usize, usize), CompatibilityReason> {
         if self.bytes.get(self.position) != Some(&b'"') {
             return Err(CompatibilityReason::UnknownAuthenticationShape);
         }
         self.position += 1;
+        let start = self.position;
         let mut non_whitespace = false;
         loop {
             let byte = *self
@@ -241,8 +248,11 @@ impl Parser<'_> {
                 .ok_or(CompatibilityReason::UnknownAuthenticationShape)?;
             match byte {
                 b'"' => {
+                    let end = self.position;
                     self.position += 1;
-                    return Ok(non_whitespace);
+                    return non_whitespace
+                        .then_some((start, end))
+                        .ok_or(CompatibilityReason::UnknownAuthenticationShape);
                 }
                 b'\\' => {
                     self.position += 1;
@@ -448,10 +458,10 @@ impl Parser<'_> {
 pub fn classify(bytes: &[u8]) -> Result<(&'static str, &'static str), CompatibilityReason> {
     std::str::from_utf8(bytes).map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
     let shape = Parser { bytes, position: 0 }.parse()?;
-    let api = shape.api_key;
+    let api = shape.api_key.is_some();
     let oauth = shape.tokens
         && shape.id_token
-        && shape.access_token
+        && shape.access_token.is_some()
         && shape.refresh_token
         && shape.account_id;
     match (api, oauth) {
@@ -460,6 +470,23 @@ pub fn classify(bytes: &[u8]) -> Result<(&'static str, &'static str), Compatibil
             "oauth",
             "tokens:{id_token,access_token,refresh_token,account_id}:string",
         )),
+        _ => Err(CompatibilityReason::UnknownAuthenticationShape),
+    }
+}
+
+pub(crate) fn authorization_span(
+    bytes: &[u8],
+) -> Result<(&'static str, (usize, usize)), CompatibilityReason> {
+    std::str::from_utf8(bytes).map_err(|_| CompatibilityReason::UnknownAuthenticationShape)?;
+    let shape = (Parser { bytes, position: 0 }).parse()?;
+    let oauth = shape.tokens
+        && shape.id_token
+        && shape.access_token.is_some()
+        && shape.refresh_token
+        && shape.account_id;
+    match (shape.api_key, oauth) {
+        (Some(span), false) => Ok(("api_key", span)),
+        (None, true) => Ok(("oauth", shape.access_token.expect("checked above"))),
         _ => Err(CompatibilityReason::UnknownAuthenticationShape),
     }
 }

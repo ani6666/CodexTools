@@ -14,6 +14,7 @@ use codex_domain::{ModelId, ProviderId, SwitchTransactionId, UnixMillis};
 use local_infrastructure::{
     FaultInjector, SensitiveTempIo, SqliteMetadataRepository, SwitchExecutor,
 };
+use native_tls as _;
 use rusqlite as _;
 use windows_platform::{RootNamespacePin, SensitiveTempFile};
 use zeroize::{Zeroize, Zeroizing};
