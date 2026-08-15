@@ -671,7 +671,12 @@ fn new_opaque_uuid() -> Result<String, M34BackendError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        fs, io,
+        path::PathBuf,
+        thread,
+    };
 
     use codex_adapter::CodexAdapter;
     use codex_application::{
@@ -715,40 +720,114 @@ mod tests {
     }
 
     struct TempArea {
+        temp_root: PathBuf,
         root: PathBuf,
         live: PathBuf,
         app_data: PathBuf,
+        created_by_helper: bool,
+    }
+
+    const TEMP_AREA_CREATE_ATTEMPTS: usize = 128;
+    const TEMP_AREA_PREFIX: &str = "codextools-m34-backend-";
+    static TEMP_AREA_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    fn next_temp_area_candidate(
+        temp_root: &Path,
+        process_id: u32,
+        timestamp_nanos: u128,
+    ) -> PathBuf {
+        let nonce = TEMP_AREA_NONCE.fetch_add(1, Ordering::Relaxed);
+        temp_root.join(format!(
+            "{TEMP_AREA_PREFIX}{process_id}-{timestamp_nanos}-{nonce}"
+        ))
     }
 
     impl TempArea {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "codextools-m34-backend-{}-{}",
-                std::process::id(),
+            Self::new_with_timestamp(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
-            ));
+            })
+            .unwrap()
+        }
+
+        fn new_with_timestamp(mut timestamp_nanos: impl FnMut() -> u128) -> io::Result<Self> {
+            let temp_root = std::env::temp_dir();
+            Self::try_new_with_candidate(&temp_root, || {
+                next_temp_area_candidate(&temp_root, std::process::id(), timestamp_nanos())
+            })
+        }
+
+        fn try_new_with_candidate(
+            temp_root: &Path,
+            mut next_candidate: impl FnMut() -> PathBuf,
+        ) -> io::Result<Self> {
+            for _ in 0..TEMP_AREA_CREATE_ATTEMPTS {
+                let root = next_candidate();
+                let is_direct_test_child = root.parent() == Some(temp_root)
+                    && root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(TEMP_AREA_PREFIX));
+                if !is_direct_test_child {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "M3.4 fixture root must be a direct system-temp child",
+                    ));
+                }
+                match fs::create_dir(&root) {
+                    Ok(()) => return Self::initialize_owned(temp_root.to_path_buf(), root),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "M3.4 fixture exhausted unique-create attempts",
+            ))
+        }
+
+        fn initialize_owned(temp_root: PathBuf, root: PathBuf) -> io::Result<Self> {
             let live = root.join("live");
             let app_data = root.join("app-data");
-            fs::create_dir_all(&live).unwrap();
-            fs::create_dir_all(&app_data).unwrap();
             let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../tests/fixtures/g1-api-key");
-            fs::copy(fixture.join("config.toml"), live.join("config.toml")).unwrap();
-            fs::copy(fixture.join("auth.json"), live.join("auth.json")).unwrap();
-            Self {
+            let initialized = (|| -> io::Result<()> {
+                fs::create_dir(&live)?;
+                fs::create_dir(&app_data)?;
+                fs::copy(fixture.join("config.toml"), live.join("config.toml"))?;
+                fs::copy(fixture.join("auth.json"), live.join("auth.json"))?;
+                Ok(())
+            })();
+            if let Err(error) = initialized {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+            Ok(Self {
+                temp_root,
                 root,
                 live,
                 app_data,
-            }
+                created_by_helper: true,
+            })
         }
     }
 
     impl Drop for TempArea {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            let is_exact_owned_root = self.created_by_helper
+                && self.root.parent() == Some(self.temp_root.as_path())
+                && self
+                    .root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(TEMP_AREA_PREFIX));
+            if is_exact_owned_root {
+                let _ = fs::remove_dir_all(&self.root);
+                self.created_by_helper = false;
+            }
         }
     }
 
@@ -875,6 +954,92 @@ mod tests {
                 .unwrap(),
             repository.get_model_preset(&preset_id).unwrap().unwrap(),
         )
+    }
+
+    #[test]
+    fn temp_area_candidate_is_unique_for_identical_timestamp() {
+        let temp_root = std::env::temp_dir();
+        let first = next_temp_area_candidate(&temp_root, 17, 23);
+        let second = next_temp_area_candidate(&temp_root, 17, 23);
+
+        assert_ne!(first, second, "同一进程与同一时间戳不得复用 fixture 根");
+    }
+
+    #[test]
+    fn temp_area_unique_create_retries_without_owning_existing_directory() {
+        let temp_root = std::env::temp_dir();
+        let collision = loop {
+            let candidate = next_temp_area_candidate(&temp_root, std::process::id(), 29);
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("collision fixture create failed: {error}"),
+            }
+        };
+        let unique = next_temp_area_candidate(&temp_root, std::process::id(), 29);
+        let mut calls = 0;
+        let area = TempArea::try_new_with_candidate(&temp_root, || {
+            calls += 1;
+            if calls == 1 {
+                collision.clone()
+            } else {
+                unique.clone()
+            }
+        })
+        .unwrap();
+        let owned = area.root.clone();
+
+        assert_eq!(calls, 2);
+        assert_ne!(owned, collision);
+        drop(area);
+        assert!(collision.is_dir(), "helper 不得清理碰撞的既有目录");
+        assert!(!owned.exists(), "helper 必须清理自己唯一创建的目录");
+        fs::remove_dir(&collision).unwrap();
+    }
+
+    #[test]
+    fn concurrent_same_timestamp_temp_areas_are_isolated_and_cleaned() {
+        const WORKERS: usize = 64;
+        const FIXED_TIMESTAMP_NANOS: u128 = 31;
+
+        let handles = (0..WORKERS)
+            .map(|_| {
+                thread::spawn(|| {
+                    let area = TempArea::new_with_timestamp(|| FIXED_TIMESTAMP_NANOS).unwrap();
+                    let backend = ProductionM34Backend::new(&area.app_data).unwrap();
+                    let mut repository = backend.repository().unwrap();
+                    let mut store = FakeCredentialStore::default();
+                    let _ = seed_target(&area, &mut repository, &mut store);
+                    fs::create_dir(&backend.credential_root).unwrap();
+                    assert!(backend.database_path.is_file());
+                    assert!(backend.credential_root.is_dir());
+                    area
+                })
+            })
+            .collect::<Vec<_>>();
+        let areas = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let roots = areas
+            .iter()
+            .map(|area| area.root.clone())
+            .collect::<Vec<_>>();
+        let app_data_roots = areas
+            .iter()
+            .map(|area| area.app_data.clone())
+            .collect::<HashSet<_>>();
+        let credential_roots = areas
+            .iter()
+            .map(|area| area.app_data.join("credentials"))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(roots.iter().collect::<HashSet<_>>().len(), WORKERS);
+        assert_eq!(app_data_roots.len(), WORKERS);
+        assert_eq!(credential_roots.len(), WORKERS);
+        assert!(roots.iter().all(|root| root.is_dir()));
+        drop(areas);
+        assert!(roots.iter().all(|root| !root.exists()));
     }
 
     #[test]
