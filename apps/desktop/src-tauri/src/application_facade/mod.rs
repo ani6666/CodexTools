@@ -2,6 +2,7 @@ mod cancellation;
 mod contract;
 mod error;
 mod events;
+mod m33;
 
 use std::sync::{Arc, Mutex};
 
@@ -19,10 +20,22 @@ pub use events::{
     EVENT_OPERATION_STATUS_V1, EventSink, EventSinkError, NoopEventSink, OperationStage,
     OperationStatus, OperationStatusEvent,
 };
+pub use m33::*;
 
 pub struct ApplicationFacade {
-    operations: Mutex<OperationRegistry>,
+    operations: Arc<Mutex<OperationRegistry>>,
     events: Arc<dyn EventSink>,
+    m33: Arc<dyn M33Backend>,
+}
+
+impl Clone for ApplicationFacade {
+    fn clone(&self) -> Self {
+        Self {
+            operations: Arc::clone(&self.operations),
+            events: Arc::clone(&self.events),
+            m33: Arc::clone(&self.m33),
+        }
+    }
 }
 
 impl fmt::Debug for ApplicationFacade {
@@ -46,9 +59,15 @@ impl Default for ApplicationFacade {
 impl ApplicationFacade {
     #[must_use]
     pub fn new(events: Arc<dyn EventSink>) -> Self {
+        Self::with_backend(events, Arc::new(UnavailableM33Backend))
+    }
+
+    #[must_use]
+    pub fn with_backend(events: Arc<dyn EventSink>, m33: Arc<dyn M33Backend>) -> Self {
         Self {
-            operations: Mutex::new(OperationRegistry::default()),
+            operations: Arc::new(Mutex::new(OperationRegistry::default())),
             events,
+            m33,
         }
     }
 

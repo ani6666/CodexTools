@@ -18,7 +18,9 @@ $application = Read-Repo 'crates/codex-application/src/preset_binding.rs'
 $infrastructure = Read-Repo 'crates/local-infrastructure/src/preset_binding.rs'
 $domain = Read-Repo 'crates/codex-domain/src/preset.rs'
 $integration = Read-Repo 'crates/local-infrastructure/tests/m27_preset_binding.rs'
-$desktopDiff = & git -C $root diff -- apps/desktop 2>&1 | Out-String
+$m27Parent = 'f8b5b75011309e753a477978c68ea3b8196db13a'
+$m27Snapshot = '8340690298a072048ff69a5ea9923b5dece87c8f'
+$desktopDiff = & git -C $root diff "$m27Parent..$m27Snapshot" -- apps/desktop 2>&1 | Out-String
 
 Assert-True ($application -match 'M27_SERVICE_VERSION' -and $application -match 'CreatePresetAndBindInput' -and $application -match 'UpdatePresetAndBindInput') '使用分离且带版本的 create/update 输入'
 Assert-True ($application -match 'trait PresetBindingRepository' -and $application -notmatch 'Option<\s*(Create|Update)PresetAndBindInput') 'application 暴露无歧义组合仓储端口'
@@ -34,7 +36,7 @@ foreach ($marker in @('fault_matrix','reopen','AlreadyApplied','foreign','concur
     Assert-True ($integration -match [regex]::Escape($marker)) "集成矩阵包含 $marker"
 }
 
-Assert-True ([string]::IsNullOrWhiteSpace($desktopDiff)) 'M2.7 不修改 apps/desktop 生产或测试代码'
+Assert-True ([string]::IsNullOrWhiteSpace($desktopDiff)) 'M2.7 snapshot 范围不修改 apps/desktop 生产或测试代码'
 Assert-True ($application -notmatch '(?i)tauri|serde|EventSink|#\[command\]' -and $infrastructure -notmatch '(?i)http|network|dpapi') 'M2.7 不引入 IPC、网络或凭据实现'
 
 Write-Host "M27_CONTRACT_SUMMARY passed=$passed failed=$failed"

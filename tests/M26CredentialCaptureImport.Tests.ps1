@@ -107,8 +107,17 @@ Assert-True (@($trustResults | Where-Object { $_.fixtureKind -ne 'real-git' -or 
 Assert-True (@($trustResults | Where-Object { $_.journalBefore -ne 0 -or $_.journalAfter -ne 0 -or $_.quarantineBefore -ne 0 -or $_.quarantineAfter -ne 0 -or $_.outsideBefore -ne $_.outsideAfter }).Count -eq 0 -and @($trustResults | Where-Object { $_.case -eq 'patch_manifest_joint' -and $_.trustAnchorKind -eq 'script-embedded' }).Count -eq 1 -and @($trustResults | Where-Object { $_.case -ne 'patch_manifest_joint' -and $_.trustAnchorKind -ne 'independent-fixture-anchor' }).Count -eq 0) 'rollback trust tamper 无 residue/outside 变化且共同替换由内嵌 anchor 阻断'
 
 $rollbackPreview = @(& pwsh -NoProfile -File $rollbackScript 2>&1)
-Assert-True ($LASTEXITCODE -eq 0) 'rollback 真实默认 dry-run 退出 0'
-Assert-True (($rollbackPreview -join "`n").Contains('trust_anchor=exact apply=false')) 'rollback dry-run 完成全部 trust/path/hash 预检'
+$rollbackExit = $LASTEXITCODE
+$snapshotHead = '8340690298a072048ff69a5ea9923b5dece87c8f'
+$currentHead = (& git -C $root rev-parse HEAD).Trim()
+$trackedDelta = @(& git -C $root diff --name-only)
+if ($currentHead -eq $snapshotHead -and $trackedDelta.Count -eq 0) {
+    Assert-True ($rollbackExit -eq 0) 'rollback 精确旧 snapshot 默认 dry-run 退出 0'
+    Assert-True (($rollbackPreview -join "`n").Contains('trust_anchor=exact apply=false')) 'rollback 精确旧 snapshot 完成全部 trust/path/hash 预检'
+} else {
+    Assert-True ($rollbackExit -ne 0) 'rollback 在 M3.3 diff/checkpoint 上 fail closed'
+    Assert-True (-not ($rollbackPreview -join "`n").Contains('trust_anchor=exact apply=false')) 'rollback 不把 M3.3 状态误认作旧 snapshot trust anchor'
+}
 Assert-True ($tests -match 'FakeCredentialStore' -and $tests -match 'WindowsDpapiCredentialStore' -and $helper -match 'SyntheticResolver') 'M2.6 同时覆盖 fault fake 与隔离 synthetic Windows DPAPI helper'
 Assert-True ($verify -match 'M26CredentialCaptureImport.Tests.ps1') '统一验证入口包含 M2.6 契约'
 Assert-True ($readme -match 'M2.6' -and $engineering -match '故障矩阵') 'README 与工程设计审计同步 M2.6'

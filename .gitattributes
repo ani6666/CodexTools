@@ -1,4 +1,5 @@
 # 默认自动识别文本文件，并在仓库中统一使用 LF。
+.gitattributes text eol=lf
 * text=auto
 
 *.md text eol=lf
@@ -8,6 +9,7 @@
 *.ts text eol=lf
 *.tsx text eol=lf
 *.js text eol=lf
+*.mjs text eol=lf
 *.jsx text eol=lf
 *.css text eol=lf
 *.html text eol=lf

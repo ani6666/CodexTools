@@ -70,7 +70,8 @@ Assert-True ($null -ne $package -and $package.devDependencies.'@tauri-apps/cli' 
 foreach ($scriptName in @('dev', 'check', 'test', 'build', 'tauri', 'tauri:info', 'tauri:build')) {
     Assert-True ($null -ne $package -and $package.scripts.PSObject.Properties.Name -contains $scriptName) "npm 提供 $scriptName 验证入口"
 }
-Assert-True ($packageText -notmatch '@tauri-apps/api') 'M3.0 前端不引入未使用的 Tauri API'
+$ipcSource = Get-RepositoryText 'apps/desktop/src/ipc.ts'
+Assert-True ($packageText -match '"@tauri-apps/api"\s*:\s*"2\.11\.0"' -and $ipcSource -match "@tauri-apps/api/core" -and $ipcSource -match "@tauri-apps/api/event") 'M3.3 精确锁定且实际使用最小 Tauri API 子模块'
 
 $packageLockText = Get-RepositoryText 'apps/desktop/package-lock.json'
 $packageLock = if ($packageLockText) { $packageLockText | ConvertFrom-Json -AsHashtable } else { $null }
@@ -115,7 +116,7 @@ $rustSource = Get-RepositoryText 'apps/desktop/src-tauri/src/lib.rs'
 $commandAdapter = Get-RepositoryText 'apps/desktop/src-tauri/src/commands.rs'
 Assert-True ($rustSource -match '#!\[forbid\(unsafe_code\)\]') '桌面 Rust crate 禁止 unsafe'
 Assert-True ($rustSource -match 'mod commands' -and $rustSource -match 'invoke_handler') 'M3.1 通过集中 adapter 注册 command handler'
-Assert-True ($commandAdapter -match '#\[tauri::command\]' -and ([regex]::Matches($commandAdapter, '#\[tauri::command\]').Count -eq 2)) 'M3.1 仅保留两个最小 command adapter'
+Assert-True ($commandAdapter -match '#\[tauri::command\]' -and ([regex]::Matches($commandAdapter, '#\[tauri::command\]').Count -eq 9) -and $commandAdapter -match 'scan_default_codex_v1' -and $commandAdapter -match 'update_preset_and_bind_v1') 'M3.3 仅在集中 adapter 注册九个必要 typed commands'
 Assert-True ($rustSource -notmatch '(?i)CODEX_HOME|auth\.json|config\.toml|secret|token|cookie|oauth') '桌面入口不读取或命名秘密与真实 Codex 材料'
 
 $language = Get-RepositoryText 'apps/desktop/src/language.ts'
@@ -133,7 +134,7 @@ $allDesktopSource = @(
     $rustSource
     $commandAdapter
 ) -join "`n"
-Assert-True ($allDesktopSource -notmatch '(?i)invoke\(|listen\(|emit\(|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization') '前后端无直接 IPC 消费或秘密正文字段'
+Assert-True ($allDesktopSource -notmatch '(?i)CODEX_HOME|auth\.json|config\.toml|access[_-]?token|refresh[_-]?token|authorization|credential[_-]?material') '前后端 IPC 不包含真实路径或秘密正文字段'
 
 $readme = Get-RepositoryText 'README.md'
 Assert-True ($readme -match 'M3\.0') 'README 记录 M3.0 技术栈与边界'

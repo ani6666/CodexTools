@@ -217,3 +217,18 @@ impl From<OAuthCaptureError> for ErrorEnvelope {
         Self::from_code(code)
     }
 }
+
+impl From<super::M33BackendError> for ErrorEnvelope {
+    fn from(error: super::M33BackendError) -> Self {
+        let code = match error {
+            super::M33BackendError::Validation => ErrorCode::Validation,
+            super::M33BackendError::NotFound => ErrorCode::NotFound,
+            super::M33BackendError::Conflict => ErrorCode::Conflict,
+            super::M33BackendError::CompatibilityProtected => ErrorCode::CompatibilityProtected,
+            super::M33BackendError::RecoveryRequired => ErrorCode::RecoveryRequired,
+            super::M33BackendError::Unavailable => ErrorCode::Unavailable,
+            super::M33BackendError::Internal => ErrorCode::Internal,
+        };
+        Self::from_code(code)
+    }
+}

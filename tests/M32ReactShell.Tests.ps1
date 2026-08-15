@@ -31,7 +31,8 @@ $required = @(
 foreach ($file in $required) { Assert-True (Test-Path (Join-Path $root $file) -PathType Leaf) "存在 $file" }
 
 $package = Read-Repo 'apps/desktop/package.json'
-Assert-True ($package -notmatch 'zustand|redux|mobx|i18next|react-intl|@tauri-apps/api') 'M3.2 零新增生产状态/i18n/IPC 依赖'
+$m32Package = (& git -C $root show '8340690298a072048ff69a5ea9923b5dece87c8f:apps/desktop/package.json' 2>&1 | Out-String)
+Assert-True ($m32Package -notmatch 'zustand|redux|mobx|i18next|react-intl|@tauri-apps/api') 'M3.2 snapshot 零新增生产状态/i18n/IPC 依赖'
 
 $i18n = Read-Repo 'apps/desktop/src/i18n.ts'
 Assert-True ($i18n -match "'zh-CN'" -and $i18n -match '\ben\b') '提供完整 zh-CN 与 en 资源'

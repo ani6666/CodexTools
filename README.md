@@ -20,7 +20,15 @@ M3.2 使用 React 19 自带的 `useReducer`/Context 建立桌面应用壳，不�
 
 设计系统以 CSS tokens 和复用的 Button/Card/StatusFeedback 组件覆盖颜色、排版、间距、焦点、按钮、表单、卡片及状态反馈。壳层支持正常、空、加载、错误、取消、重复操作和 `compatibility_protected` 展示；动态状态反馈固定为 `role=status`、`aria-live=polite`、`aria-atomic=true`，加载态同时使用 `aria-busy`。语言偏好存储采用窄作用域异常边界：读取失败或无效值按 system 降级并尽力清理，写入或删除失败不阻止当前会话切换，也不回显存储内容。具备语义 header/nav/aside/main、跳转主内容、键盘焦点、aria-current、全局通知 aria-live、表单标签、窄窗口、长文本、缩放溢出与 reduced-motion 基线；暗色模式使用高对比焦点 token 与双层焦点环。前端继续不使用 `@tauri-apps/api` 或 M3.1 IPC，capability permissions 保持为空。本阶段合同入口为 `pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1`。
 
-capability 仅绑定 `main` 窗口，权限数组为空；后续任何文件系统、Shell、窗口或业务命令权限都必须逐项评审。前端没有引入 `@tauri-apps/api`；M3.1 只在 Rust 侧注册两个合同 command，不发射真实业务事件。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token、API Key 或 Authorization 正文入口。
+### M3.3 首次受控导入、身份与模型预设
+
+M3.3 将 M2.6/M2.7 的已放行服务接入桌面生产路径。首次扫描只由“扫描本地候选”按钮显式发起，IPC 只接受 `default_codex` 受控根与 opaque identifiers；真实路径、config/auth 原文、credential material 与敏感 fingerprint context 不进入 DTO、event、DOM 或 storage。扫描通过 exact rescan 返回 secret-free 状态；导入确认进入 M3.1 不可取消临界区，并复用 M2.6 credential owner、recovery journal 与 bundle transaction。窗口挂载只刷新本地数据库中的非敏感身份摘要，不会扫描默认 Codex 根。
+
+身份列表、刷新和 rename 使用真实 SQLite repository 与 optimistic concurrency；首个身份仍只能来自 M2.6 受控导入或已有安全 reference。模型预设列表、create-and-bind 与 update-and-bind 复用 M2.7 `PresetBindingService`，前端不会用多个 invoke 拼装原子操作。managed name/model 在 DTO 构造和 domain 服务两层拒绝高置信秘密与路径形态。前端对 stale response、重复点击、卸载、IPC reject、空/加载/验证/冲突/恢复状态均使用稳定安全消息，不显示技术错误原文。
+
+Tauri adapter 仍集中在 `commands.rs`，所有 SQLite/DPAPI 工作通过 `spawn_blocking` 离开 UI 线程。`TauriEventSink` 仅发射阶段、计数、opaque id 与安全 summary code；Accepted 投递失败会在调用后端前回滚 operation 注册。capability 继续只绑定 `main` 窗口且 permissions 为空，没有引入 shell/fs/dialog/http/process plugin 或网络权限。M3.3 合同入口为 `pwsh -NoProfile -File .\tests\M33DesktopIdentity.Tests.ps1`、`cargo test -p codextools-desktop --test m33_contract --all-features` 与 `npm test`。
+
+capability 仅绑定 `main` 窗口，权限数组为空；后续任何文件系统、Shell、窗口或业务命令权限都必须逐项评审。秘密正文不得进入前端、事件、日志或错误；静态门槛与 Rust canary 合同测试会阻止桌面边界建立 `CODEX_HOME`、认证文件、Token 或 Authorization 正文入口。
 
 ### M3.0 依赖、许可证与体积评估
 
@@ -34,6 +42,7 @@ capability 仅绑定 `main` 窗口，权限数组为空；后续任何文件系�
 | `vite` 8.2.1 / `@vitejs/plugin-react` 6.0.5 | 开发服务器、TypeScript/JSX 转换和生产构建 | MIT | 与编译器及 CLI 合计后，本机完整 `node_modules` 约 84.1 MB；仅开发时使用 | 手写 Rollup/esbuild 配置需要更多维护且偏离技术栈要求 |
 | `typescript` 6.0.3 | 严格静态类型检查 | Apache-2.0 | npm 包解压约 24.3 MB，仅开发时使用 | 7.x 是更新主版本；M3.0 选择 6.x 以降低初始 Tauri/Vite 骨架的工具链新主版本叠加风险 |
 | `@types/react` / `@types/react-dom` 19.x | React 19 TypeScript 类型 | MIT | 仅开发与类型检查使用，不进入前端 bundle | 手写声明会重复上游类型且容易漂移 |
+| `@tauri-apps/api` 2.11.0 | 仅提供官方 tree-shakeable `core.invoke` 与 `event.listen`，连接版本化 M3.3 commands/events | MIT OR Apache-2.0 | 新增 1 个 direct npm package；不引入原生 plugin，实际 gzip bundle 增量在验证报告中记录 | 手写 `window.__TAURI_INTERNALS__` 会依赖私有 API；通用 fs/shell/http plugins 会扩大权限且不需要 |
 
 M3.1 仅将锁文件中已有的 `serde` 1.0.229（MIT OR Apache-2.0）提升为桌面 crate 的直接生产依赖，用于 typed IPC DTO；`serde_json` 1.0.151（MIT OR Apache-2.0）仅作为合同测试开发依赖。两者均已由 Tauri/M2 依赖图锁定，因此没有新增锁定包、没有前端 bundle 增量；替代的手写 JSON/序列化会重复成熟实现并削弱 schema/roundtrip 测试。
 
@@ -43,9 +52,9 @@ M1 Codex 格式与路径预研已经用 PowerShell 7/.NET 零依赖探针和脱�
 
 M2.6 在不增加桌面 command/UI 的前提下补齐 Rust-only 首次导入闭环：公开边界只接受 `ControlledRoot::DefaultCodex` 与 opaque scan id。后端通过 Windows known-folder API 解析默认根，并在同一个 pinned root 下以 no-follow、禁止写/delete share 的句柄读取 config/auth；scan id 同时绑定 root/config/auth 的 VolumeSerial、FileId128、长度与内容摘要。auth parser 只借用输入，SHA-256 流式处理且所有不可避免的 owned auth buffer 在成功、错误与 unwind 路径清零。
 
-credential reference/material 仍由 `CredentialService` owner + recovery journal 单独拥有；同一跨进程 owner 覆盖 exact material/reference 验证、M2.6 phase 更新和带 version/kind/schema/fingerprint 条件的 bundle transaction commit，身份绑定完成后才释放。schema v11 的非秘密 `capture_import_operations` journal 解释 DPAPI 与 identity/preset/patch bundle 之间的中间态；预检后的 commit 竞态使用 exact reference、引用检查与 credential delete recovery 持久回滚，不以 best-effort 删除宣称原子。隔离测试覆盖 API-key/OAuth、schema tamper、reparse/file replacement、owner release、journal/metadata/bundle/CAS 故障、create/rotate/delete 竞争、两个 capture 进程，以及真实 `WindowsDpapiCredentialStore` helper 在五个持久切点被终止后的 reopen 收敛；helper 只使用自己的 synthetic root/material 并完成清理。M3.3 facade/UI 仍未实现。
+credential reference/material 仍由 `CredentialService` owner + recovery journal 单独拥有；同一跨进程 owner 覆盖 exact material/reference 验证、M2.6 phase 更新和带 version/kind/schema/fingerprint 条件的 bundle transaction commit，身份绑定完成后才释放。schema v11 的非秘密 `capture_import_operations` journal 解释 DPAPI 与 identity/preset/patch bundle 之间的中间态；预检后的 commit 竞态使用 exact reference、引用检查与 credential delete recovery 持久回滚，不以 best-effort 删除宣称原子。隔离测试覆盖 API-key/OAuth、schema tamper、reparse/file replacement、owner release、journal/metadata/bundle/CAS 故障、create/rotate/delete 竞争、两个 capture 进程，以及真实 `WindowsDpapiCredentialStore` helper 在五个持久切点被终止后的 reopen 收敛；helper 只使用自己的 synthetic root/material 并完成清理。M3.3 仅通过该公开服务接入桌面，不改变原子边界。
 
-M2.7 为已有身份补齐模型预设与默认绑定的 Rust-only 原子服务。application 使用分离、带版本的 create-and-bind/update-and-bind 输入和组合 repository port；local infrastructure 在一个 SQLite `Immediate` transaction 内复读 identity/preset、执行 preset 写入与 identity CAS，再一次提交。重复的同一请求稳定返回 `AlreadyApplied`，stale version、foreign preset、唯一名冲突和并发 loser 稳定返回 `Conflict`；提交确认丢失返回 `RecoveryRequired`。受管理的 preset name/model metadata 由 domain 验证并拒绝高置信秘密与路径形态。M2.7 没有 schema migration、第三方依赖、Tauri/IPC、React、capability、网络或凭据实现变化；M3.3 仍未恢复。
+M2.7 为已有身份补齐模型预设与默认绑定的 Rust-only 原子服务。application 使用分离、带版本的 create-and-bind/update-and-bind 输入和组合 repository port；local infrastructure 在一个 SQLite `Immediate` transaction 内复读 identity/preset、执行 preset 写入与 identity CAS，再一次提交。重复的同一请求稳定返回 `AlreadyApplied`，stale version、foreign preset、唯一名冲突和并发 loser 稳定返回 `Conflict`；提交确认丢失返回 `RecoveryRequired`。受管理的 preset name/model metadata 由 domain 验证并拒绝高置信秘密与路径形态。M3.3 只增加其 desktop facade/UI adapter，没有 schema migration、网络或 credential 边界变化。
 
 恢复快照终审修正后，v11 schema 期望值由 SQLite 直接执行仓库 migration 后读取，并通过 `pragma_table_xinfo`、`index_list/index_xinfo`、STRICT 状态、保留字符串/GLOB 内容的 SQL token 比较和回滚式约束行为矩阵共同审计；格式空白、注释和语句分号可等价变化，但 GLOB/string 语义篡改 fail closed。trigger 审计忽略注释与字符串字面量，只对真实跨表 INSERT/UPDATE/DELETE ledger 依赖和挂载在 ledger 上的 trigger 阻断。metadata 缺失时的破坏性 credential recovery 只有在 material reference、generation/binding、envelope hash 与解密后的 planned fingerprint 全部吻合后才删除，材料已不存在可幂等清理，替换 plaintext、stale ref/hash 或 quarantine 双重状态均保留并返回 recovery required。跨进程写锁先固定本地卷根，再使用 `NtCreateFile` 的 `RootDirectory` handle 逐组件相对、no-follow 打开；每级可由父句柄重开并核对 identity，因此同卷 DOS alias/SUBST 在逐组件间切换也不能跨越已固定父目录。任意祖先/final/lock reparse 都 fail closed，并阻止祖先与锁文件替换竞争。config 原文、TOML text/assignment value、规划输出和 `SwitchPlan` config 均使用 `Zeroizing` ownership，相关 Debug 只输出固定脱敏标记。不同受控根共享 credential 的并发 helper 只有在 repository/store 已打开并到达 owner/CAS 调用边界后才发出 barrier，测试只接受一个 Imported/AlreadyImported 与一个 Conflict，并精确核对最终 material/reference/identity/preset/patch/journal。rollback 工具嵌入 patch/manifest/entry-set trust anchor，逐组件拒绝 reparse，默认 dry-run；Apply 会先保存 durable journal 与 final backups，再做 tracked reverse 和 ignored 原子替换，失败自动补偿或保留机器可恢复状态。
 
@@ -72,6 +81,8 @@ cargo build --workspace --all-targets
 pwsh -NoProfile -File .\tests\M30DesktopSkeleton.Tests.ps1
 pwsh -NoProfile -File .\tests\M31ApplicationFacade.Tests.ps1
 pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1
+pwsh -NoProfile -File .\tests\M33DesktopIdentity.Tests.ps1
+cargo test -p codextools-desktop --test m33_contract --all-features
 Push-Location .\apps\desktop
 npm ci --ignore-scripts
 npm test

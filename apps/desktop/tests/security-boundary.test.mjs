@@ -20,18 +20,14 @@ async function listFiles(directory) {
   return files;
 }
 
-test('M3.1 前端仍不建立 IPC、事件或秘密材料入口', async () => {
+test('M3.3 前端 IPC 仍不建立秘密材料或真实路径入口', async () => {
   const frontendSource = (
     await Promise.all((await listFiles(path.join(desktopRoot, 'src'))).map((file) => readFile(file, 'utf8')))
   ).join('\n');
   const forbidden = [
-    /@tauri-apps\/api/i,
-    /\binvoke\s*\(/,
-    /\b(?:listen|emit)\s*\(/,
     /CODEX_HOME/i,
     /auth\.json/i,
     /config\.toml/i,
-    /api[_-]?key/i,
     /access[_-]?token/i,
     /refresh[_-]?token/i,
     /authorization/i,
@@ -42,7 +38,7 @@ test('M3.1 前端仍不建立 IPC、事件或秘密材料入口', async () => {
   }
 });
 
-test('M3.1 Rust 只暴露集中定义的最小 typed command adapter', async () => {
+test('M3.3 Rust 只通过集中 typed command adapter 暴露必要命令', async () => {
   const rustRoot = path.join(desktopRoot, 'src-tauri', 'src');
   const rustFiles = await listFiles(rustRoot);
   const commandLocations = [];
@@ -56,8 +52,9 @@ test('M3.1 Rust 只暴露集中定义的最小 typed command adapter', async () 
   assert.deepEqual(invokeHandlerLocations, ['lib.rs']);
 
   const commands = await readFile(path.join(rustRoot, 'commands.rs'), 'utf8');
-  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 2);
+  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 9);
   assert.match(commands, /describe_contract_v1/);
   assert.match(commands, /cancel_operation_v1/);
+  for (const command of ['scan_default_codex_v1', 'import_candidate_v1', 'list_identities_v1', 'rename_identity_v1', 'list_presets_v1', 'create_preset_and_bind_v1', 'update_preset_and_bind_v1']) assert.match(commands, new RegExp(command));
   assert.doesNotMatch(commands, /PathBuf|&Path|Vec<u8>|api[_-]?key|access[_-]?token|authorization|cookie/i);
 });

@@ -51,6 +51,29 @@ impl OperationStatusEvent {
             summary_code: None,
         }
     }
+
+    #[must_use]
+    pub fn finished(
+        operation_id: SafeIdentifier,
+        correlation_id: SafeIdentifier,
+        succeeded: bool,
+        summary_code: SafeIdentifier,
+    ) -> Self {
+        Self {
+            schema_version: M31_CONTRACT_VERSION,
+            operation_id,
+            correlation_id,
+            stage: OperationStage::Completed,
+            status: if succeeded {
+                OperationStatus::Succeeded
+            } else {
+                OperationStatus::Failed
+            },
+            completed_items: u64::from(succeeded),
+            total_items: Some(1),
+            summary_code: Some(summary_code),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
