@@ -1483,7 +1483,7 @@ impl ModelPresetRepository for SqliteMetadataRepository {
     }
 }
 
-fn identity_select() -> &'static str {
+pub(crate) fn identity_select() -> &'static str {
     "SELECT runtime_identities.id, runtime_identities.name, runtime_identities.provider_id,
             runtime_identities.provider_display_name, runtime_identities.api_base_url,
             runtime_identities.management_url, runtime_identities.auth_mode,
@@ -1493,7 +1493,7 @@ fn identity_select() -> &'static str {
      FROM runtime_identities"
 }
 
-fn preset_select() -> &'static str {
+pub(crate) fn preset_select() -> &'static str {
     "SELECT id, identity_id, name, model_id, created_at_unix_ms, updated_at_unix_ms, version
      FROM model_presets"
 }
@@ -1521,7 +1521,7 @@ fn identity_params(identity: &RuntimeIdentity) -> [rusqlite::types::Value; 13] {
     ]
 }
 
-fn preset_params(preset: &ModelPreset) -> [rusqlite::types::Value; 7] {
+pub(crate) fn preset_params(preset: &ModelPreset) -> [rusqlite::types::Value; 7] {
     use rusqlite::types::Value;
     [
         Value::Text(preset.id().as_str().to_owned()),
@@ -1548,7 +1548,7 @@ fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<CredentialReference> {
     .map_err(|error| conversion_error(0, error))
 }
 
-fn identity_from_row(row: &Row<'_>) -> rusqlite::Result<RuntimeIdentity> {
+pub(crate) fn identity_from_row(row: &Row<'_>) -> rusqlite::Result<RuntimeIdentity> {
     let credential_id = parse(row, 7, CredentialRefId::parse)?;
     let auth_mode = parse(row, 6, AuthMode::from_storage)?;
     let credential_kind = match auth_mode {
@@ -1581,7 +1581,7 @@ fn identity_from_row(row: &Row<'_>) -> rusqlite::Result<RuntimeIdentity> {
     .map_err(|error| conversion_error(0, error))
 }
 
-fn preset_from_row(row: &Row<'_>) -> rusqlite::Result<ModelPreset> {
+pub(crate) fn preset_from_row(row: &Row<'_>) -> rusqlite::Result<ModelPreset> {
     ModelPreset::restore(
         parse(row, 0, ModelPresetId::parse)?,
         parse(row, 1, IdentityId::parse)?,
@@ -1728,7 +1728,7 @@ pub(crate) fn map_write_error(
     RepositoryError::storage_unavailable()
 }
 
-fn version_to_i64(version: EntityVersion) -> i64 {
+pub(crate) fn version_to_i64(version: EntityVersion) -> i64 {
     i64::try_from(version.value()).expect("validated entity version fits SQLite INTEGER")
 }
 

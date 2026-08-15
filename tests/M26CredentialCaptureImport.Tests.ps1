@@ -84,8 +84,8 @@ Assert-True ($rollback -match '\[switch\]\$Apply' -and $rollback -match 'Get-Fil
 Assert-True ($windowsHandle -match 'fn NtCreateFile' -and $windowsHandle -match 'root_directory' -and $windowsHandle -match 'open_relative') 'RootNamespacePin 逐组件使用 RootDirectory handle-relative no-follow 打开'
 Assert-True ($windowsHandle -match 'subst_mapping_changes_between_components' -and $windowsHandle -match 'reopen_relative_identity') '真实 DOS alias 切换与父子关系回归已固化'
 Assert-True ($helper -match 'OWNER_CAS_READY' -and $tests -match '64 \| 65 \| 66 \| 67') '不同根 helper 在 owner/CAS 边界握手并拒绝模糊退出状态'
-Assert-True ($rollback -match 'EXPECTED_PATCH_SHA256' -and $rollback -match 'EXPECTED_MANIFEST_SHA256' -and $rollback -match 'ROLLBACK_JOURNAL' -and $rollback -match 'Invoke-Compensation') 'rollback 固定 trust anchor 并持久记录可补偿状态'
-Assert-True ($rollback -match 'junction=blocked' -and $rollback -match 'patch_interrupt=compensated' -and $rollback -match 'delete_interrupt=compensated') 'rollback 隔离 fixture 覆盖篡改、junction 与中断补偿'
+Assert-True ($rollback -match 'EXPECTED_PATCH_SHA256' -and $rollback -match 'EXPECTED_MANIFEST_SHA256' -and $rollback -match 'ROLLBACK_JOURNAL' -and $rollback -match 'backup_cleanup_\$\{i\}_intent' -and $rollback -match 'comp_restore_\$\{i\}_intent' -and $rollback -match 'comp_quarantine_\$\{i\}_intent' -and $rollback -match 'comp_backup_\$\{i\}_intent' -and $rollback -match 'journal phase regression') 'rollback 固定 trust anchor 并逐文件持久化 cleanup/compensation 状态'
+Assert-True ($rollback -match 'Invoke-TrustTamperCase' -and $rollback -match 'Get-FixtureDigest' -and $rollback -match 'New-EmbeddedFixtureScript' -and $rollback -match "'patch_manifest_joint'" -and $rollback -match "'manifest_entry_path'" -and $rollback -match "'manifest_entry_hash'" -and $rollback -match '\[IO\.File\]::Delete\(\$baseline\)' -and $rollback -match 'M26_SELFTEST_RESULT=') 'rollback 隔离 fixture 实际篡改 trust 资产并输出结构化证据'
 
 $rollbackScript = Join-Path $root '.tmp/rollback-m26-recovery.ps1'
 $rollbackSelfTest = @(& pwsh -NoProfile -File $rollbackScript -SelfTest 2>&1)
@@ -93,15 +93,18 @@ Assert-True ($LASTEXITCODE -eq 0) 'rollback 隔离 fixture 退出 0'
 $rollbackSelfText = $rollbackSelfTest -join "`n"
 foreach ($marker in @(
     'junction=blocked',
-    'patch_tamper=blocked',
-    'manifest_tamper=blocked',
-    'baseline_missing=blocked',
     'patch_interrupt=compensated',
     'copy_interrupt=compensated',
     'delete_interrupt=compensated'
 )) {
     Assert-True ($rollbackSelfText.Contains($marker)) "rollback 隔离 fixture：$marker"
 }
+$trustResults = @($rollbackSelfTest | Where-Object { $_ -is [string] -and $_.StartsWith('M26_SELFTEST_RESULT=') } | ForEach-Object { $_.Substring('M26_SELFTEST_RESULT='.Length) | ConvertFrom-Json })
+$expectedTrustCases = @('baseline_content', 'baseline_missing', 'manifest_entry_hash', 'manifest_entry_path', 'manifest_modified', 'patch_manifest_joint', 'patch_modified')
+$actualTrustCases = @($trustResults.case | Sort-Object)
+Assert-True ($trustResults.Count -eq 7 -and ($actualTrustCases -join "`n") -eq ($expectedTrustCases -join "`n")) 'rollback trust tamper 使用七个 fresh 隔离真实 Git fixture'
+Assert-True (@($trustResults | Where-Object { $_.fixtureKind -ne 'real-git' -or -not $_.mutationApplied -or $_.applyExit -eq 0 -or $_.recoverExit -eq 0 -or -not $_.stateUnchanged -or $_.beforeDigest -ne $_.afterDigest }).Count -eq 0) 'rollback trust tamper 的 Apply/Recover 均拒绝且 repo byte digest 不变'
+Assert-True (@($trustResults | Where-Object { $_.journalBefore -ne 0 -or $_.journalAfter -ne 0 -or $_.quarantineBefore -ne 0 -or $_.quarantineAfter -ne 0 -or $_.outsideBefore -ne $_.outsideAfter }).Count -eq 0 -and @($trustResults | Where-Object { $_.case -eq 'patch_manifest_joint' -and $_.trustAnchorKind -eq 'script-embedded' }).Count -eq 1 -and @($trustResults | Where-Object { $_.case -ne 'patch_manifest_joint' -and $_.trustAnchorKind -ne 'independent-fixture-anchor' }).Count -eq 0) 'rollback trust tamper 无 residue/outside 变化且共同替换由内嵌 anchor 阻断'
 
 $rollbackPreview = @(& pwsh -NoProfile -File $rollbackScript 2>&1)
 Assert-True ($LASTEXITCODE -eq 0) 'rollback 真实默认 dry-run 退出 0'

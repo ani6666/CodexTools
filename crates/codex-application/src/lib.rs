@@ -10,6 +10,8 @@ use codex_domain::{
 
 pub mod codex;
 pub use codex::*;
+mod preset_binding;
+pub use preset_binding::*;
 mod capture_import;
 pub use capture_import::*;
 mod backup;

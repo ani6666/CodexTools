@@ -8,6 +8,7 @@ mod credential_service;
 mod import;
 mod migration;
 mod oauth;
+mod preset_binding;
 mod repository;
 mod switch;
 mod vertical;
@@ -30,6 +31,7 @@ pub use migration::{
     MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MigrationError,
 };
 pub use oauth::{OAuthCaptureRequest, OAuthCaptureService, SystemOAuthProcessRunner};
+pub use preset_binding::{NoPresetBindingFaults, PresetBindingFaultPoint, PresetBindingFaults};
 pub use repository::{
     OpenRepositoryError, SensitiveDestinationGuard, SensitiveDestinationState,
     SensitiveTempAnomaly, SensitiveTempLifecycle, SensitiveTempOwnerRecord, SensitiveTempPhase,

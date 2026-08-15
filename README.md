@@ -45,6 +45,8 @@ M2.6 在不增加桌面 command/UI 的前提下补齐 Rust-only 首次导入闭�
 
 credential reference/material 仍由 `CredentialService` owner + recovery journal 单独拥有；同一跨进程 owner 覆盖 exact material/reference 验证、M2.6 phase 更新和带 version/kind/schema/fingerprint 条件的 bundle transaction commit，身份绑定完成后才释放。schema v11 的非秘密 `capture_import_operations` journal 解释 DPAPI 与 identity/preset/patch bundle 之间的中间态；预检后的 commit 竞态使用 exact reference、引用检查与 credential delete recovery 持久回滚，不以 best-effort 删除宣称原子。隔离测试覆盖 API-key/OAuth、schema tamper、reparse/file replacement、owner release、journal/metadata/bundle/CAS 故障、create/rotate/delete 竞争、两个 capture 进程，以及真实 `WindowsDpapiCredentialStore` helper 在五个持久切点被终止后的 reopen 收敛；helper 只使用自己的 synthetic root/material 并完成清理。M3.3 facade/UI 仍未实现。
 
+M2.7 为已有身份补齐模型预设与默认绑定的 Rust-only 原子服务。application 使用分离、带版本的 create-and-bind/update-and-bind 输入和组合 repository port；local infrastructure 在一个 SQLite `Immediate` transaction 内复读 identity/preset、执行 preset 写入与 identity CAS，再一次提交。重复的同一请求稳定返回 `AlreadyApplied`，stale version、foreign preset、唯一名冲突和并发 loser 稳定返回 `Conflict`；提交确认丢失返回 `RecoveryRequired`。受管理的 preset name/model metadata 由 domain 验证并拒绝高置信秘密与路径形态。M2.7 没有 schema migration、第三方依赖、Tauri/IPC、React、capability、网络或凭据实现变化；M3.3 仍未恢复。
+
 恢复快照终审修正后，v11 schema 期望值由 SQLite 直接执行仓库 migration 后读取，并通过 `pragma_table_xinfo`、`index_list/index_xinfo`、STRICT 状态、保留字符串/GLOB 内容的 SQL token 比较和回滚式约束行为矩阵共同审计；格式空白、注释和语句分号可等价变化，但 GLOB/string 语义篡改 fail closed。trigger 审计忽略注释与字符串字面量，只对真实跨表 INSERT/UPDATE/DELETE ledger 依赖和挂载在 ledger 上的 trigger 阻断。metadata 缺失时的破坏性 credential recovery 只有在 material reference、generation/binding、envelope hash 与解密后的 planned fingerprint 全部吻合后才删除，材料已不存在可幂等清理，替换 plaintext、stale ref/hash 或 quarantine 双重状态均保留并返回 recovery required。跨进程写锁先固定本地卷根，再使用 `NtCreateFile` 的 `RootDirectory` handle 逐组件相对、no-follow 打开；每级可由父句柄重开并核对 identity，因此同卷 DOS alias/SUBST 在逐组件间切换也不能跨越已固定父目录。任意祖先/final/lock reparse 都 fail closed，并阻止祖先与锁文件替换竞争。config 原文、TOML text/assignment value、规划输出和 `SwitchPlan` config 均使用 `Zeroizing` ownership，相关 Debug 只输出固定脱敏标记。不同受控根共享 credential 的并发 helper 只有在 repository/store 已打开并到达 owner/CAS 调用边界后才发出 barrier，测试只接受一个 Imported/AlreadyImported 与一个 Conflict，并精确核对最终 material/reference/identity/preset/patch/journal。rollback 工具嵌入 patch/manifest/entry-set trust anchor，逐组件拒绝 reparse，默认 dry-run；Apply 会先保存 durable journal 与 final backups，再做 tracked reverse 和 ignored 原子替换，失败自动补偿或保留机器可恢复状态。
 
 ## 核心方向
@@ -85,6 +87,7 @@ pwsh -NoProfile -File .\tests\M23SwitchTransaction.Tests.ps1
 pwsh -NoProfile -File .\tests\M24CredentialBackup.Tests.ps1
 pwsh -NoProfile -File .\tests\M25VerticalClosure.Tests.ps1
 pwsh -NoProfile -File .\tests\M26CredentialCaptureImport.Tests.ps1
+pwsh -NoProfile -File .\tests\M27PresetBinding.Tests.ps1
 ```
 
 本地协作工作树可能提供 `scripts/verify-repo.ps1` 统一入口；`scripts/` 属于 Git 忽略的本地协作资料，公开克隆不保证包含该脚本，因此不作为公开验证入口。

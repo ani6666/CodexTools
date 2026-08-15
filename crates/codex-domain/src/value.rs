@@ -166,6 +166,13 @@ impl EntityName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn ensure_preset_metadata_safe(&self) -> Result<(), DomainError> {
+        if self.0.contains(['/', '\\']) || looks_like_rooted_path(&self.0) {
+            return Err(DomainError::InvalidFormat);
+        }
+        Ok(())
+    }
 }
 
 /// Codex Provider 标识。
@@ -209,6 +216,30 @@ impl ModelId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn ensure_preset_metadata_safe(&self) -> Result<(), DomainError> {
+        let value = self.0.as_str();
+        if looks_like_rooted_path(value)
+            || value.starts_with("~/")
+            || value.ends_with('/')
+            || value.contains("//")
+            || value
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+        {
+            return Err(DomainError::InvalidFormat);
+        }
+        Ok(())
+    }
+}
+
+fn looks_like_rooted_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '\\'])
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 /// 不包含查询、片段或用户信息的 HTTP(S) 端点。
