@@ -10,20 +10,26 @@ export interface OperationProvenance extends IdentityProvenance {
   endpointPolicy: EndpointPolicy;
 }
 export interface ProvenancedModelCandidate extends ModelCandidate {
+  requestToken: number;
   provenance: OperationProvenance;
+}
+export interface CandidateSaveContext {
+  identity: IdentitySummary | null;
+  requestToken: number;
+  provenance: OperationProvenance | null;
 }
 export interface M35State {
   status: M35Status;
   requestToken: number;
   operationId: string | null;
-  identityProvenance: IdentityProvenance | null;
+  currentProvenance: OperationProvenance | null;
   requestProvenance: OperationProvenance | null;
   models: ProvenancedModelCandidate[];
   errorCode: SafeErrorCode | null;
   retryable: boolean;
 }
 export type M35Action =
-  | { type: 'identity-changed'; requestToken: number; provenance: IdentityProvenance | null }
+  | { type: 'source-changed'; requestToken: number; provenance: OperationProvenance | null }
   | { type: 'probe-started'; requestToken: number; operationId: string; provenance: OperationProvenance }
   | { type: 'probe-finished'; requestToken: number; provenance: OperationProvenance }
   | { type: 'discovery-started'; requestToken: number; operationId: string; provenance: OperationProvenance }
@@ -47,19 +53,33 @@ export function sameOperationProvenance(left: OperationProvenance | null, right:
   return sameIdentityProvenance(left, right) && left?.endpointPolicy === right?.endpointPolicy;
 }
 
-export function candidateSaveIdentity(identity: IdentitySummary | null, candidate: ProvenancedModelCandidate): IdentitySummary | null {
-  if (!identity || !sameIdentityProvenance(identityProvenance(identity), candidate.provenance)) return null;
+export function candidateSaveIdentity(context: CandidateSaveContext, candidate: ProvenancedModelCandidate): IdentitySummary | null {
+  if (!context.identity
+    || context.requestToken !== candidate.requestToken
+    || !sameOperationProvenance(context.provenance, candidate.provenance)
+    || !sameIdentityProvenance(identityProvenance(context.identity), candidate.provenance)) return null;
   return {
-    ...identity,
+    ...context.identity,
     identityId: candidate.provenance.identityId,
     credentialRefId: candidate.provenance.credentialRefId,
     version: candidate.provenance.identityVersion,
   };
 }
 
-function idleState(provenance: IdentityProvenance | null, requestToken: number): M35State {
+export async function bindCandidateIfCurrent(
+  candidate: ProvenancedModelCandidate,
+  readCurrent: () => CandidateSaveContext,
+  bind: (identity: IdentitySummary, candidate: ProvenancedModelCandidate) => Promise<void>,
+): Promise<boolean> {
+  const identity = candidateSaveIdentity(readCurrent(), candidate);
+  if (!identity) return false;
+  await bind(identity, candidate);
+  return true;
+}
+
+function idleState(provenance: OperationProvenance | null, requestToken: number): M35State {
   return {
-    status: 'idle', requestToken, operationId: null, identityProvenance: provenance,
+    status: 'idle', requestToken, operationId: null, currentProvenance: provenance,
     requestProvenance: null, models: [], errorCode: null, retryable: false,
   };
 }
@@ -74,18 +94,18 @@ function matchesRequest(state: M35State, requestToken: number, provenance: Opera
 
 export function m35Reducer(state: M35State, action: M35Action): M35State {
   switch (action.type) {
-    case 'identity-changed': return idleState(action.provenance, action.requestToken);
+    case 'source-changed': return idleState(action.provenance, action.requestToken);
     case 'probe-started':
-      if (!sameIdentityProvenance(state.identityProvenance, action.provenance)) return state;
-      return { ...idleState(state.identityProvenance, action.requestToken), status: 'probing', operationId: action.operationId, requestProvenance: action.provenance };
+      if (!sameOperationProvenance(state.currentProvenance, action.provenance)) return state;
+      return { ...idleState(state.currentProvenance, action.requestToken), status: 'probing', operationId: action.operationId, requestProvenance: action.provenance };
     case 'discovery-started':
-      if (!sameIdentityProvenance(state.identityProvenance, action.provenance)) return state;
-      return { ...idleState(state.identityProvenance, action.requestToken), status: 'discovering', operationId: action.operationId, requestProvenance: action.provenance };
+      if (!sameOperationProvenance(state.currentProvenance, action.provenance)) return state;
+      return { ...idleState(state.currentProvenance, action.requestToken), status: 'discovering', operationId: action.operationId, requestProvenance: action.provenance };
     case 'probe-finished':
       return matchesRequest(state, action.requestToken, action.provenance) ? { ...state, status: 'reachable', operationId: null } : state;
     case 'discovery-finished':
       return matchesRequest(state, action.requestToken, action.provenance)
-        ? { ...state, status: 'ready', operationId: null, models: action.models.map((model) => ({ ...model, provenance: action.provenance })) }
+        ? { ...state, status: 'ready', operationId: null, models: action.models.map((model) => ({ ...model, requestToken: action.requestToken, provenance: action.provenance })) }
         : state;
     case 'cancel-finished':
       if (!matchesRequest(state, action.requestToken, action.provenance)) return state;
@@ -96,6 +116,6 @@ export function m35Reducer(state: M35State, action: M35Action): M35State {
       if (!matchesRequest(state, action.requestToken, action.provenance)) return state;
       return { ...state, status: action.code === 'cancelled' ? 'cancelled' : 'error', operationId: null, errorCode: action.code, retryable: action.retryable };
     case 'unmounted': return idleState(null, Number.MAX_SAFE_INTEGER);
-    case 'reset': return idleState(state.identityProvenance, state.requestToken + 1);
+    case 'reset': return idleState(state.currentProvenance, state.requestToken + 1);
   }
 }

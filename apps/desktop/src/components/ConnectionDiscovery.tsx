@@ -1,22 +1,21 @@
-import { useState } from 'react';
 import type { EndpointPolicy, IdentitySummary } from '../ipc';
 import type { M35State, ProvenancedModelCandidate } from '../m35-state';
 import { Button } from './Button';
 
 interface Props {
   identity: IdentitySummary | null; state: M35State; busy: boolean; t: (key: string) => string;
+  policy: EndpointPolicy; onPolicyChange: (policy: EndpointPolicy) => void;
   onProbe: (policy: EndpointPolicy) => void; onDiscover: (policy: EndpointPolicy) => void;
   onCancel: () => void; onUseModel: (model: ProvenancedModelCandidate) => Promise<void>;
 }
 
-export function ConnectionDiscovery({ identity, state, busy, t, onProbe, onDiscover, onCancel, onUseModel }: Props) {
-  const [policy, setPolicy] = useState<EndpointPolicy>('public_https');
+export function ConnectionDiscovery({ identity, state, busy, t, policy, onPolicyChange, onProbe, onDiscover, onCancel, onUseModel }: Props) {
   const active = state.status === 'probing' || state.status === 'discovering' || state.status === 'cancelling';
   return <section className="work-panel connection-discovery" aria-labelledby="connection-title" aria-busy={active}>
     <div className="work-panel__heading"><div><h2 id="connection-title">{t('m35.connection.title')}</h2><p>{t('m35.connection.description')}</p></div></div>
     {!identity ? <p className="empty-copy" role="status">{t('m35.connection.chooseIdentity')}</p> : <>
       <label htmlFor="endpoint-policy">{t('m35.connection.policy')}</label>
-      <select id="endpoint-policy" value={policy} disabled={busy || active} onChange={(event) => setPolicy(event.target.value as EndpointPolicy)}>
+      <select id="endpoint-policy" value={policy} disabled={busy} onChange={(event) => onPolicyChange(event.target.value as EndpointPolicy)}>
         <option value="public_https">{t('m35.connection.publicHttps')}</option>
         <option value="loopback_development">{t('m35.connection.loopback')}</option>
       </select>

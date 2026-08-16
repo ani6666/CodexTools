@@ -39,6 +39,8 @@ $activation = Read-Repo 'apps/desktop/src-tauri/src/window_activation.rs'
 $cargo = Read-Repo 'apps/desktop/src-tauri/Cargo.toml'
 $ipc = Read-Repo 'apps/desktop/src/ipc.ts'
 $app = Read-Repo 'apps/desktop/src/App.tsx'
+$m35State = Read-Repo 'apps/desktop/src/m35-state.ts'
+$connection = Read-Repo 'apps/desktop/src/components/ConnectionDiscovery.tsx'
 $capability = Read-Repo 'apps/desktop/src-tauri/capabilities/default.json' | ConvertFrom-Json
 
 Assert-True ($contract -match 'M35_CONTRACT_VERSION' -and $contract -match 'deny_unknown_fields') 'M3.5 DTO 版本化且拒绝未知字段'
@@ -72,6 +74,11 @@ Assert-True ($contract -match 'request_app_exit_with_sink' -and $contract -match
 Assert-True ($ipc -match 'probeConnection' -and $ipc -match 'discoverModels') 'frontend 仅通过 typed invoke 请求连接与候选'
 Assert-True (($ipc + $app) -notmatch '\b(fetch|XMLHttpRequest|WebSocket)\b') 'frontend 不直接发起网络请求'
 Assert-True ($app -notmatch 'useEffect[\s\S]{0,300}(probeConnection|discoverModels)') 'mount/languagechange 不触发联网'
+Assert-True ($m35State -match 'ProvenancedModelCandidate[\s\S]{0,180}requestToken' -and $m35State -match 'bindCandidateIfCurrent' -and $m35State -match 'sameOperationProvenance\(context\.provenance, candidate\.provenance\)') '候选保存精确绑定 request token 与完整 operation provenance'
+$policyHandler = [regex]::Match($app, 'const changeConnectionPolicy[\s\S]*?\n  };').Value
+Assert-True ($connection -match 'onPolicyChange' -and $policyHandler -match 'connectionPolicyRef\.current = policy[\s\S]*setConnectionPolicy\(policy\)[\s\S]*rotateConnectionSource' -and $policyHandler -notmatch 'probeConnection|discoverModels') 'endpoint policy 变化同步失效来源且不自动联网'
+$saveHandler = [regex]::Match($app, 'const useCandidate[\s\S]*?\n  };').Value
+Assert-True ($saveHandler -match 'bindCandidateIfCurrent' -and $saveHandler -match 'selectedIdentityRef\.current' -and $saveHandler -match 'connectionSourceRef\.current') '候选保存调用前从同步 current refs 重验身份、token 与 policy'
 
 $permissions = @($capability.permissions | Sort-Object)
 $expected = @('core:event:allow-listen','core:event:allow-unlisten') | Sort-Object
