@@ -166,9 +166,13 @@ pub struct CancellationController {
 
 const OPERATION_READY: u8 = 0;
 const OPERATION_CLAIMED: u8 = 1;
-const OPERATION_CANCELLED: u8 = 2;
-const OPERATION_COMPLETED: u8 = 3;
-const OPERATION_ABANDONED: u8 = 4;
+// 取消只沿两条单向路径交付一次：Ready→PendingUnclaimed→Delivered，
+// 或 Claimed→PendingClaimed→Delivered；任何状态都不会回到 Ready/Claimed。
+const OPERATION_CANCEL_PENDING_UNCLAIMED: u8 = 2;
+const OPERATION_CANCEL_PENDING_CLAIMED: u8 = 3;
+const OPERATION_CANCEL_DELIVERED: u8 = 4;
+const OPERATION_COMPLETED: u8 = 5;
+const OPERATION_ABANDONED: u8 = 6;
 
 pub struct OperationLease {
     owner: Arc<AtomicU8>,
@@ -187,13 +191,23 @@ impl fmt::Debug for OperationLease {
 
 impl Drop for OperationLease {
     fn drop(&mut self) {
-        if self.active {
-            let _ = self.owner.compare_exchange(
-                OPERATION_CLAIMED,
+        if !self.active {
+            return;
+        }
+        let mut current = self.owner.load(Ordering::Acquire);
+        while matches!(
+            current,
+            OPERATION_CLAIMED | OPERATION_CANCEL_PENDING_CLAIMED
+        ) {
+            match self.owner.compare_exchange(
+                current,
                 OPERATION_ABANDONED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            );
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
     }
 }
@@ -235,19 +249,39 @@ impl CancellationController {
     }
 
     pub fn begin(&self) -> Result<OperationLease, BeginDisposition> {
-        match self.state.compare_exchange(
-            OPERATION_READY,
-            OPERATION_CLAIMED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(OperationLease {
-                owner: self.state.clone(),
-                active: true,
-            }),
-            Err(OPERATION_CANCELLED) => Err(BeginDisposition::Cancelled),
-            Err(OPERATION_CLAIMED) => Err(BeginDisposition::AlreadyClaimed),
-            Err(_) => Err(BeginDisposition::AlreadyTerminal),
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            match current {
+                OPERATION_READY => match self.state.compare_exchange(
+                    OPERATION_READY,
+                    OPERATION_CLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return Ok(OperationLease {
+                            owner: self.state.clone(),
+                            active: true,
+                        });
+                    }
+                    Err(actual) => current = actual,
+                },
+                OPERATION_CANCEL_PENDING_UNCLAIMED => {
+                    match self.state.compare_exchange(
+                        OPERATION_CANCEL_PENDING_UNCLAIMED,
+                        OPERATION_CANCEL_DELIVERED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Err(BeginDisposition::Cancelled),
+                        Err(actual) => current = actual,
+                    }
+                }
+                OPERATION_CLAIMED | OPERATION_CANCEL_PENDING_CLAIMED => {
+                    return Err(BeginDisposition::AlreadyClaimed);
+                }
+                _ => return Err(BeginDisposition::AlreadyTerminal),
+            }
         }
     }
 
@@ -256,9 +290,14 @@ impl CancellationController {
         loop {
             match current {
                 OPERATION_READY | OPERATION_CLAIMED => {
+                    let pending = if current == OPERATION_READY {
+                        OPERATION_CANCEL_PENDING_UNCLAIMED
+                    } else {
+                        OPERATION_CANCEL_PENDING_CLAIMED
+                    };
                     match self.state.compare_exchange(
                         current,
-                        OPERATION_CANCELLED,
+                        pending,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
@@ -266,7 +305,9 @@ impl CancellationController {
                         Err(actual) => current = actual,
                     }
                 }
-                OPERATION_CANCELLED => return CancelDisposition::AlreadyCancelled,
+                OPERATION_CANCEL_PENDING_UNCLAIMED
+                | OPERATION_CANCEL_PENDING_CLAIMED
+                | OPERATION_CANCEL_DELIVERED => return CancelDisposition::AlreadyCancelled,
                 _ => return CancelDisposition::TooLate,
             }
         }
@@ -280,15 +321,31 @@ impl CancellationController {
         if !Arc::ptr_eq(&self.state, &lease.owner) {
             return PublishDisposition::InvalidLease;
         }
-        let disposition = match self.state.compare_exchange(
-            OPERATION_CLAIMED,
-            OPERATION_COMPLETED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => PublishDisposition::Published,
-            Err(OPERATION_CANCELLED) => PublishDisposition::Cancelled,
-            Err(_) => PublishDisposition::AlreadyPublished,
+        let mut current = self.state.load(Ordering::Acquire);
+        let disposition = loop {
+            match current {
+                OPERATION_CLAIMED => match self.state.compare_exchange(
+                    OPERATION_CLAIMED,
+                    OPERATION_COMPLETED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break PublishDisposition::Published,
+                    Err(actual) => current = actual,
+                },
+                OPERATION_CANCEL_PENDING_CLAIMED => {
+                    match self.state.compare_exchange(
+                        OPERATION_CANCEL_PENDING_CLAIMED,
+                        OPERATION_CANCEL_DELIVERED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break PublishDisposition::Cancelled,
+                        Err(actual) => current = actual,
+                    }
+                }
+                _ => break PublishDisposition::AlreadyPublished,
+            }
         };
         lease.active = false;
         disposition
@@ -297,7 +354,12 @@ impl CancellationController {
 
 impl CancellationProbe for CancellationController {
     fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == OPERATION_CANCELLED
+        matches!(
+            self.state.load(Ordering::Acquire),
+            OPERATION_CANCEL_PENDING_UNCLAIMED
+                | OPERATION_CANCEL_PENDING_CLAIMED
+                | OPERATION_CANCEL_DELIVERED
+        )
     }
 }
 
@@ -1342,6 +1404,33 @@ mod tests {
         let cancellation = CancellationController::new();
         assert_eq!(cancellation.cancel(), CancelDisposition::Cancelled);
         assert_eq!(cancellation.cancel(), CancelDisposition::AlreadyCancelled);
+        assert!(matches!(
+            cancellation.begin(),
+            Err(super::BeginDisposition::Cancelled)
+        ));
+        assert!(matches!(
+            cancellation.begin(),
+            Err(super::BeginDisposition::AlreadyTerminal)
+        ));
+        assert_eq!(cancellation.cancel(), CancelDisposition::AlreadyCancelled);
+
+        let claimed_cancel = CancellationController::new();
+        let mut cancelled_lease = claimed_cancel.begin().unwrap();
+        assert_eq!(claimed_cancel.cancel(), CancelDisposition::Cancelled);
+        assert_eq!(claimed_cancel.cancel(), CancelDisposition::AlreadyCancelled);
+        assert_eq!(
+            claimed_cancel.finish(&mut cancelled_lease),
+            super::PublishDisposition::Cancelled
+        );
+        assert_eq!(
+            claimed_cancel.finish(&mut cancelled_lease),
+            super::PublishDisposition::AlreadyPublished
+        );
+        assert!(matches!(
+            claimed_cancel.begin(),
+            Err(super::BeginDisposition::AlreadyTerminal)
+        ));
+        assert_eq!(claimed_cancel.cancel(), CancelDisposition::AlreadyCancelled);
         let completed = CancellationController::new();
         let mut lease = completed.begin().unwrap();
         assert_eq!(
@@ -1679,6 +1768,40 @@ mod service_tests {
             ))
         }
     }
+
+    struct CancellingCountingTransport(Arc<LayerCounters>);
+    impl ApprovedHttpTransport for CancellingCountingTransport {
+        fn get_models(
+            &mut self,
+            _: &ApprovedHttpTarget,
+            authorization: &mut [u8],
+            _: &dyn CancellationProbe,
+        ) -> Result<TransportResponse, TransportErrorCode> {
+            assert_eq!(authorization, secret_canary());
+            self.0.transport.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(TransportErrorCode::Cancelled)
+        }
+    }
+
+    struct BarrierCancellingTransport {
+        counters: Arc<LayerCounters>,
+        entered: mpsc::SyncSender<()>,
+        release: Arc<Barrier>,
+    }
+    impl ApprovedHttpTransport for BarrierCancellingTransport {
+        fn get_models(
+            &mut self,
+            _: &ApprovedHttpTarget,
+            authorization: &mut [u8],
+            _: &dyn CancellationProbe,
+        ) -> Result<TransportResponse, TransportErrorCode> {
+            assert_eq!(authorization, secret_canary());
+            self.counters.transport.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered.send(()).unwrap();
+            self.release.wait();
+            Err(TransportErrorCode::Cancelled)
+        }
+    }
     fn fixture() -> (FakeRepository, FakeStore, DiscoverModelsInput) {
         fixture_with_counters(None)
     }
@@ -1935,6 +2058,11 @@ mod service_tests {
             Ok(DiscoverModelsOutcome::Cancelled)
         );
         assert_eq!(
+            service.discover_models(&input, &cancellation),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(transport.calls.get(), 0);
+        assert_eq!(
             cancellation.cancel(),
             super::CancelDisposition::AlreadyCancelled
         );
@@ -1994,6 +2122,10 @@ mod service_tests {
             Ok(super::ProbeConnectionOutcome::Cancelled)
         );
         assert_eq!(
+            service.probe_connection(&probe, &cancelled_probe),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(
             cancelled_probe.cancel(),
             super::CancelDisposition::AlreadyCancelled
         );
@@ -2014,6 +2146,10 @@ mod service_tests {
         assert_eq!(
             service.discover_models(&input, &cancelled_discovery),
             Ok(DiscoverModelsOutcome::Cancelled)
+        );
+        assert_eq!(
+            service.discover_models(&input, &cancelled_discovery),
+            Err(DiscoveryErrorCode::Internal)
         );
 
         let completed_discovery = CancellationController::new();
@@ -2136,7 +2272,7 @@ mod service_tests {
         );
         assert_eq!(
             service.discover_models(&input, &cancellation),
-            Ok(DiscoverModelsOutcome::Cancelled)
+            Err(DiscoveryErrorCode::Internal)
         );
         assert_eq!(transport.calls.get(), 0);
     }
@@ -2193,11 +2329,27 @@ mod service_tests {
             publish_gate.controller.cancel(),
             super::CancelDisposition::Cancelled
         );
+        let counters = Arc::new(LayerCounters::default());
+        assert_eq!(
+            run_counted_call(false, &publish_gate.controller, counters.clone()),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+        assert_eq!(
+            publish_gate.controller.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
         publish_barrier.wait();
         assert_eq!(
             cancelled_worker.join().unwrap(),
             Ok(DiscoverModelsOutcome::Cancelled)
         );
+        let counters = Arc::new(LayerCounters::default());
+        assert_eq!(
+            run_counted_call(false, &publish_gate.controller, counters.clone()),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
         assert_eq!(
             publish_gate.controller.cancel(),
             super::CancelDisposition::AlreadyCancelled
@@ -2213,6 +2365,68 @@ mod service_tests {
         let resolver = CountingResolver(counters.clone());
         let parser = CountingParser(counters.clone());
         let mut transport = CountingTransport(counters);
+        let mut service =
+            SafeModelDiscoveryService::new(&repository, &store, &resolver, &parser, &mut transport);
+        if probe {
+            service
+                .probe_connection(&probe_from(&input), controller)
+                .map(|outcome| match outcome {
+                    super::ProbeConnectionOutcome::Reachable(_) => "payload",
+                    super::ProbeConnectionOutcome::Cancelled => "cancelled",
+                })
+        } else {
+            service
+                .discover_models(&input, controller)
+                .map(|outcome| match outcome {
+                    DiscoverModelsOutcome::Models(_) => "payload",
+                    DiscoverModelsOutcome::Cancelled => "cancelled",
+                })
+        }
+    }
+
+    fn run_counted_cancel_call(
+        probe: bool,
+        controller: &dyn super::OperationControl,
+        counters: Arc<LayerCounters>,
+    ) -> Result<&'static str, DiscoveryErrorCode> {
+        let (repository, store, input) = fixture_with_counters(Some(counters.clone()));
+        let resolver = CountingResolver(counters.clone());
+        let parser = CountingParser(counters.clone());
+        let mut transport = CancellingCountingTransport(counters);
+        let mut service =
+            SafeModelDiscoveryService::new(&repository, &store, &resolver, &parser, &mut transport);
+        if probe {
+            service
+                .probe_connection(&probe_from(&input), controller)
+                .map(|outcome| match outcome {
+                    super::ProbeConnectionOutcome::Reachable(_) => "payload",
+                    super::ProbeConnectionOutcome::Cancelled => "cancelled",
+                })
+        } else {
+            service
+                .discover_models(&input, controller)
+                .map(|outcome| match outcome {
+                    DiscoverModelsOutcome::Models(_) => "payload",
+                    DiscoverModelsOutcome::Cancelled => "cancelled",
+                })
+        }
+    }
+
+    fn run_barrier_cancel_call(
+        probe: bool,
+        controller: &dyn super::OperationControl,
+        counters: Arc<LayerCounters>,
+        entered: mpsc::SyncSender<()>,
+        release: Arc<Barrier>,
+    ) -> Result<&'static str, DiscoveryErrorCode> {
+        let (repository, store, input) = fixture_with_counters(Some(counters.clone()));
+        let resolver = CountingResolver(counters.clone());
+        let parser = CountingParser(counters.clone());
+        let mut transport = BarrierCancellingTransport {
+            counters,
+            entered,
+            release,
+        };
         let mut service =
             SafeModelDiscoveryService::new(&repository, &store, &resolver, &parser, &mut transport);
         if probe {
@@ -2307,28 +2521,142 @@ mod service_tests {
         );
         assert_eq!(
             run_counted_call(false, &before, counters.clone()),
-            Ok("cancelled")
+            Err(DiscoveryErrorCode::Internal)
         );
         assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
 
-        let controller = CancellationController::new();
-        let (claimed_tx, claimed_rx) = mpsc::sync_channel(1);
-        let release = Arc::new(Barrier::new(2));
-        let gate = Arc::new(ClaimGate {
-            controller: controller.clone(),
-            claimed_tx,
-            release: release.clone(),
-        });
-        let worker_gate = gate.clone();
-        let counters = Arc::new(LayerCounters::default());
-        let worker_counters = counters.clone();
-        let worker =
-            thread::spawn(move || run_counted_call(false, worker_gate.as_ref(), worker_counters));
-        claimed_rx.recv().unwrap();
-        assert_eq!(controller.cancel(), super::CancelDisposition::Cancelled);
-        release.wait();
-        assert_eq!(worker.join().unwrap(), Ok("cancelled"));
-        assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+        for probe in [false, true] {
+            let controller = CancellationController::new();
+            let (claimed_tx, claimed_rx) = mpsc::sync_channel(1);
+            let release = Arc::new(Barrier::new(2));
+            let gate = Arc::new(ClaimGate {
+                controller: controller.clone(),
+                claimed_tx,
+                release: release.clone(),
+            });
+            let worker_gate = gate.clone();
+            let counters = Arc::new(LayerCounters::default());
+            let worker_counters = counters.clone();
+            let worker = thread::spawn(move || {
+                run_counted_call(probe, worker_gate.as_ref(), worker_counters)
+            });
+            claimed_rx.recv().unwrap();
+            assert_eq!(controller.cancel(), super::CancelDisposition::Cancelled);
+            assert_eq!(
+                run_counted_call(probe, &controller, counters.clone()),
+                Err(DiscoveryErrorCode::Internal)
+            );
+            assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+            assert_eq!(
+                controller.cancel(),
+                super::CancelDisposition::AlreadyCancelled
+            );
+            release.wait();
+            assert_eq!(worker.join().unwrap(), Ok("cancelled"));
+            assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+            assert_eq!(
+                run_counted_call(probe, &controller, counters.clone()),
+                Err(DiscoveryErrorCode::Internal)
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_before_begin_is_delivered_once_under_concurrent_reuse() {
+        for probe in [false, true] {
+            let controller = CancellationController::new();
+            assert_eq!(controller.cancel(), super::CancelDisposition::Cancelled);
+            let counters = Arc::new(LayerCounters::default());
+            let start = Arc::new(Barrier::new(3));
+            let (result_tx, result_rx) = mpsc::sync_channel(2);
+            let workers = (0..2)
+                .map(|_| {
+                    let worker_controller = controller.clone();
+                    let worker_counters = counters.clone();
+                    let worker_start = start.clone();
+                    let worker_tx = result_tx.clone();
+                    thread::spawn(move || {
+                        worker_start.wait();
+                        worker_tx
+                            .send(run_counted_call(probe, &worker_controller, worker_counters))
+                            .unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            let results = [result_rx.recv().unwrap(), result_rx.recv().unwrap()];
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| **result == Ok("cancelled"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| **result == Err(DiscoveryErrorCode::Internal))
+                    .count(),
+                1
+            );
+            assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+            assert_eq!(
+                controller.cancel(),
+                super::CancelDisposition::AlreadyCancelled
+            );
+        }
+    }
+
+    #[test]
+    fn lower_layer_cancel_is_delivered_once_for_sequential_and_concurrent_reuse() {
+        for probe in [false, true] {
+            let sequential = CancellationController::new();
+            let counters = Arc::new(LayerCounters::default());
+            assert_eq!(
+                run_counted_cancel_call(probe, &sequential, counters.clone()),
+                Ok("cancelled")
+            );
+            assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
+            assert_eq!(
+                run_counted_call(probe, &sequential, counters.clone()),
+                Err(DiscoveryErrorCode::Internal)
+            );
+            assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
+
+            let concurrent = CancellationController::new();
+            let counters = Arc::new(LayerCounters::default());
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let release = Arc::new(Barrier::new(2));
+            let worker_controller = concurrent.clone();
+            let worker_counters = counters.clone();
+            let worker_release = release.clone();
+            let worker = thread::spawn(move || {
+                run_barrier_cancel_call(
+                    probe,
+                    &worker_controller,
+                    worker_counters,
+                    entered_tx,
+                    worker_release,
+                )
+            });
+            entered_rx.recv().unwrap();
+            assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
+            assert_eq!(
+                run_counted_call(probe, &concurrent, counters.clone()),
+                Err(DiscoveryErrorCode::Internal)
+            );
+            assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
+            release.wait();
+            assert_eq!(worker.join().unwrap(), Ok("cancelled"));
+            assert_eq!(
+                run_counted_call(probe, &concurrent, counters.clone()),
+                Err(DiscoveryErrorCode::Internal)
+            );
+            assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
+        }
     }
 
     #[test]
@@ -2362,7 +2690,7 @@ mod service_tests {
         }
         assert!(matches!(
             controller.begin(),
-            Err(super::BeginDisposition::Cancelled)
+            Err(super::BeginDisposition::AlreadyTerminal)
         ));
     }
 
@@ -2419,6 +2747,22 @@ mod service_tests {
         );
         assert_eq!(counters.snapshot(), [1, 1, 1, 1, 1]);
         assert_eq!(controller.cancel(), super::CancelDisposition::TooLate);
+
+        let cancelled_abandon = CancellationController::new();
+        let cancelled_lease = cancelled_abandon.begin().unwrap();
+        assert_eq!(
+            cancelled_abandon.cancel(),
+            super::CancelDisposition::Cancelled
+        );
+        drop(cancelled_lease);
+        assert!(matches!(
+            cancelled_abandon.begin(),
+            Err(super::BeginDisposition::AlreadyTerminal)
+        ));
+        assert_eq!(
+            cancelled_abandon.cancel(),
+            super::CancelDisposition::TooLate
+        );
     }
 
     struct PublishBarrierGate {
@@ -2560,10 +2904,25 @@ mod service_tests {
             publish_gate.controller.cancel(),
             super::CancelDisposition::Cancelled
         );
+        let counters = Arc::new(LayerCounters::default());
+        assert_eq!(
+            run_counted_call(true, &publish_gate.controller, counters.clone()),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
+        assert_eq!(
+            publish_gate.controller.cancel(),
+            super::CancelDisposition::AlreadyCancelled
+        );
         publish_barrier.wait();
         assert_eq!(
             publish_worker.join().unwrap(),
             Ok(super::ProbeConnectionOutcome::Cancelled)
         );
+        assert_eq!(
+            run_counted_call(true, &publish_gate.controller, counters.clone()),
+            Err(DiscoveryErrorCode::Internal)
+        );
+        assert_eq!(counters.snapshot(), [0, 0, 0, 0, 0]);
     }
 }
