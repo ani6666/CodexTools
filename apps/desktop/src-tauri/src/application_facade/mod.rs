@@ -2,6 +2,7 @@ mod cancellation;
 mod contract;
 mod error;
 mod events;
+mod lifecycle;
 mod m33;
 mod m34;
 mod m35;
@@ -22,12 +23,17 @@ pub use events::{
     EVENT_OPERATION_STATUS_V1, EventSink, EventSinkError, NoopEventSink, OperationStage,
     OperationStatus, OperationStatusEvent,
 };
+pub use lifecycle::{
+    ProcessAdmissionLease, ProcessExitPermit, ProcessLifecycleGate, ProcessLifecyclePhase,
+    ProcessLifecycleSnapshot,
+};
 pub use m33::*;
 pub use m34::*;
 pub use m35::*;
 
 pub struct ApplicationFacade {
     operations: Arc<Mutex<OperationRegistry>>,
+    lifecycle: ProcessLifecycleGate,
     events: Arc<dyn EventSink>,
     m33: Arc<dyn M33Backend>,
     m34: Arc<dyn M34Backend>,
@@ -38,6 +44,7 @@ impl Clone for ApplicationFacade {
     fn clone(&self) -> Self {
         Self {
             operations: Arc::clone(&self.operations),
+            lifecycle: self.lifecycle.clone(),
             events: Arc::clone(&self.events),
             m33: Arc::clone(&self.m33),
             m34: Arc::clone(&self.m34),
@@ -98,11 +105,20 @@ impl ApplicationFacade {
     ) -> Self {
         Self {
             operations: Arc::new(Mutex::new(OperationRegistry::default())),
+            lifecycle: ProcessLifecycleGate::default(),
             events,
             m33,
             m34,
             m35,
         }
+    }
+
+    pub fn lifecycle_gate(&self) -> ProcessLifecycleGate {
+        self.lifecycle.clone()
+    }
+
+    pub fn admit_business_command(&self) -> Result<ProcessAdmissionLease, ErrorEnvelope> {
+        self.lifecycle.try_admit()
     }
 
     pub fn describe_contract(

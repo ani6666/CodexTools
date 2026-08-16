@@ -4,7 +4,7 @@ import { listen, type Event, type UnlistenFn } from '@tauri-apps/api/event';
 const schemaVersion = 1;
 const root = 'default_codex' as const;
 
-export type SafeErrorCode = 'validation' | 'not_found' | 'conflict' | 'plan_stale' | 'compatibility_protected' | 'cancelled' | 'recovery_required' | 'unavailable' | 'auth_required' | 'forbidden' | 'rate_limited' | 'timeout' | 'tls_failure' | 'network_unavailable' | 'invalid_response' | 'response_too_large' | 'internal';
+export type SafeErrorCode = 'validation' | 'not_found' | 'conflict' | 'exit_in_progress' | 'plan_stale' | 'compatibility_protected' | 'cancelled' | 'recovery_required' | 'unavailable' | 'auth_required' | 'forbidden' | 'rate_limited' | 'timeout' | 'tls_failure' | 'network_unavailable' | 'invalid_response' | 'response_too_large' | 'internal';
 export type ScanStatus = 'not_found' | 'candidate' | 'duplicate' | 'compatibility_protected' | 'conflict' | 'recovery_required' | 'error';
 export interface ScanCandidate { scanId: string; authMode: 'api_key' | 'o_auth' }
 export interface ScanResult { status: ScanStatus; candidate: ScanCandidate | null; existingIdentityId: string | null }
@@ -38,7 +38,7 @@ export function operationId(): string { return crypto.randomUUID(); }
 
 function safeError(error: unknown): never {
   const candidate = typeof error === 'object' && error !== null ? (error as ErrorEnvelope).code : undefined;
-  const allowed: SafeErrorCode[] = ['validation', 'not_found', 'conflict', 'plan_stale', 'compatibility_protected', 'cancelled', 'recovery_required', 'unavailable', 'auth_required', 'forbidden', 'rate_limited', 'timeout', 'tls_failure', 'network_unavailable', 'invalid_response', 'response_too_large', 'internal'];
+  const allowed: SafeErrorCode[] = ['validation', 'not_found', 'conflict', 'exit_in_progress', 'plan_stale', 'compatibility_protected', 'cancelled', 'recovery_required', 'unavailable', 'auth_required', 'forbidden', 'rate_limited', 'timeout', 'tls_failure', 'network_unavailable', 'invalid_response', 'response_too_large', 'internal'];
   throw new SafeIpcError(allowed.includes(candidate as SafeErrorCode) ? candidate as SafeErrorCode : 'internal', Boolean(typeof error === 'object' && error !== null && (error as ErrorEnvelope).retryable));
 }
 

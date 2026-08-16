@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::{ErrorEnvelope, SafeIdentifier, ensure_version};
 
@@ -110,6 +111,10 @@ pub trait M35Backend: Send + Sync {
     }
 }
 
+pub trait ExitSink: Send + Sync {
+    fn exit(&self, code: i32);
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnavailableM35Backend;
 impl M35Backend for UnavailableM35Backend {
@@ -129,15 +134,22 @@ impl super::ApplicationFacade {
         self.m35.cancel_all();
     }
 
-    pub fn prepare_app_exit(
+    pub fn request_app_exit_with_sink(
         &self,
         request: RequestAppExitRequest,
+        timeout: Duration,
+        exit_sink: &dyn ExitSink,
     ) -> Result<RequestAppExitResponse, ErrorEnvelope> {
         ensure_version(request.schema_version)?;
+        let permit = self.lifecycle_gate().begin_exit()?;
         self.m35.cancel_all();
-        if self.operation_count()? != 0 || self.m35.active_operation_count() != 0 {
+        if !permit.wait_for_zero(timeout)?
+            || self.operation_count()? != 0
+            || self.m35.active_operation_count() != 0
+        {
             return Err(ErrorEnvelope::from_code(super::ErrorCode::Conflict));
         }
+        exit_sink.exit(0);
         Ok(RequestAppExitResponse {
             schema_version: M35_CONTRACT_VERSION,
             correlation_id: request.correlation_id,

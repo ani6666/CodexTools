@@ -102,6 +102,7 @@ const zhCN = {
   'm33.error.validation': '输入未通过安全校验，请检查名称或模型标识。',
   'm33.error.not_found': '目标已不存在，请刷新后重试。',
   'm33.error.conflict': '数据已被其他操作更新，请刷新后重试。',
+  'm33.error.exit_in_progress': '应用正在安全退出，已拒绝新的业务操作。',
   'm33.error.compatibility_protected': '操作已被兼容性保护阻止。',
   'm33.error.cancelled': '操作已在安全检查点取消。',
   'm33.error.recovery_required': '结果需要恢复确认，请停止重复操作。',
@@ -198,6 +199,7 @@ const zhCN = {
   'm35.error.validation': '身份或端点策略无效。',
   'm35.error.not_found': '身份或凭据引用已不存在。',
   'm35.error.conflict': '身份或凭据已变化，请刷新。',
+  'm35.error.exit_in_progress': '应用正在安全退出，不能开始新的连接操作。',
   'm35.error.plan_stale': '状态已失效，请刷新。',
   'm35.error.compatibility_protected': '凭据形状无法安全确认，需要重新认证。',
   'm35.error.cancelled': '操作已取消。',
@@ -212,8 +214,10 @@ const zhCN = {
   'm35.error.invalid_response': '服务响应不兼容。',
   'm35.error.response_too_large': '服务响应超过安全限制。',
   'm35.error.internal': '操作未完成，技术详情已隐藏。',
+  'm35.provenanceMismatch': '身份或凭据已变化，旧模型候选已清除；请重新发现模型。',
   'm35.exit.action': '安全退出',
   'm35.exit.waiting': '正在安全退出…',
+  'm35.exit.retry': '再次检查并安全退出',
   'm35.exit.busy': '仍有操作正在收敛。窗口关闭只会隐藏；请稍后再次安全退出。',
 } as const;
 
@@ -319,6 +323,7 @@ const en: Record<MessageKey, string> = {
   'm33.error.validation': 'The input failed safety validation. Check the name or model identifier.',
   'm33.error.not_found': 'The target no longer exists. Refresh and try again.',
   'm33.error.conflict': 'Another operation updated this data. Refresh and try again.',
+  'm33.error.exit_in_progress': 'The app is exiting safely and rejected the new operation.',
   'm33.error.compatibility_protected': 'Compatibility protection blocked this operation.',
   'm33.error.cancelled': 'The operation was cancelled at a safe checkpoint.',
   'm33.error.recovery_required': 'The result requires recovery confirmation. Do not repeat the operation.',
@@ -415,6 +420,7 @@ const en: Record<MessageKey, string> = {
   'm35.error.validation': 'The identity or endpoint policy is invalid.',
   'm35.error.not_found': 'The identity or credential reference no longer exists.',
   'm35.error.conflict': 'The identity or credential changed. Refresh first.',
+  'm35.error.exit_in_progress': 'The app is exiting safely and cannot start a new connection operation.',
   'm35.error.plan_stale': 'The state expired. Refresh first.',
   'm35.error.compatibility_protected': 'Credential validity cannot be proven safely. Re-authenticate.',
   'm35.error.cancelled': 'The operation was cancelled.',
@@ -429,8 +435,10 @@ const en: Record<MessageKey, string> = {
   'm35.error.invalid_response': 'The service response is incompatible.',
   'm35.error.response_too_large': 'The service response exceeded the safety limit.',
   'm35.error.internal': 'The operation did not finish. Technical details are hidden.',
+  'm35.provenanceMismatch': 'The identity or credential changed. Old model candidates were cleared; discover models again.',
   'm35.exit.action': 'Exit safely',
   'm35.exit.waiting': 'Exiting safely…',
+  'm35.exit.retry': 'Check again and exit safely',
   'm35.exit.busy': 'An operation is still settling. Closing only hides the window; try safe exit again shortly.',
 };
 

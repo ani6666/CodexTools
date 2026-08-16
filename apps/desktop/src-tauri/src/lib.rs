@@ -10,6 +10,7 @@ mod commands;
 mod m33_backend;
 mod m34_backend;
 mod m35_backend;
+mod window_activation;
 
 #[derive(Clone)]
 struct TauriEventSink(tauri::AppHandle);
@@ -60,9 +61,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
+                let activation = window_activation::TauriMainWindowActivation(window);
+                let _ = window_activation::activate_main_window(&activation);
             }
         }))
         .setup(|app| {

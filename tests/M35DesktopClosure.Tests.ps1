@@ -34,6 +34,8 @@ $commands = Read-Repo 'apps/desktop/src-tauri/src/commands.rs'
 $lib = Read-Repo 'apps/desktop/src-tauri/src/lib.rs'
 $windowsPlatform = Read-Repo 'crates/windows-platform/src/single_instance.rs'
 $rustContract = Read-Repo 'apps/desktop/src-tauri/tests/m35_contract.rs'
+$lifecycle = Read-Repo 'apps/desktop/src-tauri/src/application_facade/lifecycle.rs'
+$activation = Read-Repo 'apps/desktop/src-tauri/src/window_activation.rs'
 $cargo = Read-Repo 'apps/desktop/src-tauri/Cargo.toml'
 $ipc = Read-Repo 'apps/desktop/src/ipc.ts'
 $app = Read-Repo 'apps/desktop/src/App.tsx'
@@ -44,15 +46,29 @@ Assert-True ($contract -notmatch '(?i)PathBuf|&Path|Vec<u8>|authorization|token|
 foreach ($command in @('probe_connection_v1','discover_models_v1','request_app_exit_v1')) { Assert-True ($commands -match $command) "注册 $command" }
 Assert-True ($backend -match 'SafeModelDiscoveryService' -and $backend -match 'NativeHttpTransport' -and $backend -match 'SystemDnsResolver') '生产 backend 复用 M2.8 安全服务与 transport'
 Assert-True ($backend -match 'MAX_ACTIVE_OPERATIONS' -and $backend -match 'CancellationController') '网络 operation registry 有界并复用 M2.8 取消控制器'
+Assert-True ($lifecycle -match 'Condvar' -and $lifecycle -match 'ProcessLifecyclePhase' -and $lifecycle -match 'ExitInProgress') '进程生命周期 gate 原子 admission、draining 与无 sleep 等待'
+$expectedExempt = @('describe_contract_v1', 'cancel_operation_v1', 'request_app_exit_v1')
+$expectedAdmitted = @('scan_default_codex_v1', 'import_candidate_v1', 'list_identities_v1', 'rename_identity_v1', 'list_presets_v1', 'create_preset_and_bind_v1', 'update_preset_and_bind_v1', 'preview_switch_v1', 'execute_switch_v1', 'query_switch_operation_v1', 'list_switch_recoveries_v1', 'recover_switch_v1', 'probe_connection_v1', 'discover_models_v1')
+$declaredExempt = [regex]::Match($commands, 'ADMISSION_EXEMPT_COMMANDS:[^=]+?=\s*\[(?<body>[\s\S]*?)\];').Groups['body'].Value
+$exactExempt = @([regex]::Matches($declaredExempt, '"(?<name>[a-z0-9_]+)"') | ForEach-Object { $_.Groups['name'].Value })
+$allCommands = @([regex]::Matches($commands, '#\[tauri::command\]\s*pub(?:\s+async)?\s+fn\s+(?<name>[a-z0-9_]+)') | ForEach-Object { $_.Groups['name'].Value })
+$admittedBodiesMatch = $true
+foreach ($name in $expectedAdmitted) {
+    $body = [regex]::Match($commands, "pub\s+async\s+fn\s+$name[\s\S]*?(?=#\[tauri::command\]|pub\s+fn\s+registered_handlers)").Value
+    if ($body -notmatch 'run_admitted_blocking') { $admittedBodiesMatch = $false }
+}
+Assert-True ((Compare-Object ($expectedExempt | Sort-Object) ($exactExempt | Sort-Object)).Count -eq 0 -and (Compare-Object (($expectedExempt + $expectedAdmitted) | Sort-Object) ($allCommands | Sort-Object)).Count -eq 0 -and $admittedBodiesMatch) 'typed command 统一 admission 且豁免 allowlist 精确'
 Assert-True ($backend -match 'current_exe' -and $backend -match 'CODEXTOOLS_M35_NATIVE_CHILD') 'native harness 通过 fresh test process 驱动 production backend'
 Assert-True ($cargo -match 'tauri-plugin-single-instance\s*=\s*\{\s*version\s*=\s*"=') 'single-instance 官方插件精确锁版本'
 Assert-True ($lib -match 'tauri_plugin_single_instance::init' -and $lib -match 'get_webview_window\("main"\)') '第二实例仅恢复并聚焦 main 窗口'
 Assert-True ($windowsPlatform -match 'CreateMutexW' -and $windowsPlatform -match 'CreateEventW' -and $windowsPlatform -match 'WaitForSingleObject') 'Windows 启动门禁以 mutex+ready event 消除主实例建窗竞态'
 Assert-True ($lib -match 'InstanceStartupDisposition::Secondary' -and $lib -match 'mark_ready') '第二实例 fail closed，主实例完成 setup 后才发布 ready'
 Assert-True ($rustContract -match 'real_process_gate_is_unique_barriered_and_recovers_after_crash') '单实例以真实 helper process、barrier 与 crash recovery 验证'
+Assert-True ($activation -match 'activate_main_window' -and $activation -match 'show' -and $activation -match 'unminimize' -and $activation -match 'focus') '单实例窗口激活顺序可独立测试且逐步吸收失败'
+Assert-True ($activation -notmatch '\bexit\s*\(' -and $lib -notmatch 'single_instance[\s\S]{0,500}\.exit\s*\(') '第二实例激活路径不能触发退出'
 Assert-True ($lib -notmatch '(?i)emit.*single|argv.*emit|cwd.*emit') 'second-instance argv/cwd 不转发前端'
 Assert-True ($lib -match 'CloseRequested' -and $lib -match 'prevent_close' -and $lib -match 'cancel_network_operations') '窗口关闭只隐藏并取消网络操作'
-Assert-True ($commands -match 'prepare_app_exit' -and $commands -match 'app\.exit\(0\)') '显式安全退出通过 registry 门禁后调用原生退出'
+Assert-True ($contract -match 'request_app_exit_with_sink' -and $contract -match 'begin_exit' -and $contract -match 'wait_for_zero' -and $commands -match 'TauriExitSink' -and $commands -match 'request_app_exit_with_sink') '显式安全退出在 sealed gate 内通过 ExitSink 调用原生退出'
 Assert-True ($ipc -match 'probeConnection' -and $ipc -match 'discoverModels') 'frontend 仅通过 typed invoke 请求连接与候选'
 Assert-True (($ipc + $app) -notmatch '\b(fetch|XMLHttpRequest|WebSocket)\b') 'frontend 不直接发起网络请求'
 Assert-True ($app -notmatch 'useEffect[\s\S]{0,300}(probeConnection|discoverModels)') 'mount/languagechange 不触发联网'

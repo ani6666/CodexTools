@@ -2,8 +2,8 @@ use crate::application_facade::{
     ApplicationFacade, CancelOperationRequest, CancelOperationResponse, CreatePresetAndBindRequest,
     DescribeContractRequest, DescribeContractResponse, DiscoverModelsRequest,
     DiscoverModelsResponse, ErrorCode, ErrorEnvelope, ExecuteSwitchRequest, ExecuteSwitchResponse,
-    ImportCandidateRequest, ImportCandidateResponse, ListIdentitiesRequest, ListIdentitiesResponse,
-    ListPresetsRequest, ListPresetsResponse, ListSwitchRecoveriesRequest,
+    ExitSink, ImportCandidateRequest, ImportCandidateResponse, ListIdentitiesRequest,
+    ListIdentitiesResponse, ListPresetsRequest, ListPresetsResponse, ListSwitchRecoveriesRequest,
     ListSwitchRecoveriesResponse, PresetBindingResponse, PreviewSwitchRequest,
     PreviewSwitchResponse, ProbeConnectionRequest, ProbeConnectionResponse,
     QuerySwitchOperationRequest, QuerySwitchOperationResponse, RecoverSwitchRequest,
@@ -11,6 +11,14 @@ use crate::application_facade::{
     RequestAppExitResponse, ScanDefaultCodexRequest, ScanDefaultCodexResponse,
     UpdatePresetAndBindRequest,
 };
+use std::time::Duration;
+
+pub const ADMISSION_EXEMPT_COMMANDS: [&str; 3] = [
+    "describe_contract_v1",
+    "cancel_operation_v1",
+    "request_app_exit_v1",
+];
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[tauri::command]
 pub fn describe_contract_v1(
@@ -36,13 +44,25 @@ async fn run_blocking<T: Send + 'static>(
         .map_err(|_| ErrorEnvelope::from_code(ErrorCode::Internal))?
 }
 
+async fn run_admitted_blocking<T: Send + 'static>(
+    facade: ApplicationFacade,
+    task: impl FnOnce(&ApplicationFacade) -> Result<T, ErrorEnvelope> + Send + 'static,
+) -> Result<T, ErrorEnvelope> {
+    let admission = facade.admit_business_command()?;
+    run_blocking(move || {
+        let _admission = admission;
+        task(&facade)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn scan_default_codex_v1(
     facade: tauri::State<'_, ApplicationFacade>,
     request: ScanDefaultCodexRequest,
 ) -> Result<ScanDefaultCodexResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.scan_default_codex(request)).await
+    run_admitted_blocking(facade, move |facade| facade.scan_default_codex(request)).await
 }
 
 #[tauri::command]
@@ -51,7 +71,7 @@ pub async fn import_candidate_v1(
     request: ImportCandidateRequest,
 ) -> Result<ImportCandidateResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.import_candidate(request)).await
+    run_admitted_blocking(facade, move |facade| facade.import_candidate(request)).await
 }
 
 #[tauri::command]
@@ -60,7 +80,7 @@ pub async fn list_identities_v1(
     request: ListIdentitiesRequest,
 ) -> Result<ListIdentitiesResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.list_identities(request)).await
+    run_admitted_blocking(facade, move |facade| facade.list_identities(request)).await
 }
 
 #[tauri::command]
@@ -69,7 +89,7 @@ pub async fn rename_identity_v1(
     request: RenameIdentityRequest,
 ) -> Result<RenameIdentityResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.rename_identity(request)).await
+    run_admitted_blocking(facade, move |facade| facade.rename_identity(request)).await
 }
 
 #[tauri::command]
@@ -78,7 +98,7 @@ pub async fn list_presets_v1(
     request: ListPresetsRequest,
 ) -> Result<ListPresetsResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.list_presets(request)).await
+    run_admitted_blocking(facade, move |facade| facade.list_presets(request)).await
 }
 
 #[tauri::command]
@@ -87,7 +107,7 @@ pub async fn create_preset_and_bind_v1(
     request: CreatePresetAndBindRequest,
 ) -> Result<PresetBindingResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.create_preset_and_bind(request)).await
+    run_admitted_blocking(facade, move |facade| facade.create_preset_and_bind(request)).await
 }
 
 #[tauri::command]
@@ -96,7 +116,7 @@ pub async fn update_preset_and_bind_v1(
     request: UpdatePresetAndBindRequest,
 ) -> Result<PresetBindingResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.update_preset_and_bind(request)).await
+    run_admitted_blocking(facade, move |facade| facade.update_preset_and_bind(request)).await
 }
 
 #[tauri::command]
@@ -105,7 +125,7 @@ pub async fn preview_switch_v1(
     request: PreviewSwitchRequest,
 ) -> Result<PreviewSwitchResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.preview_switch(request)).await
+    run_admitted_blocking(facade, move |facade| facade.preview_switch(request)).await
 }
 
 #[tauri::command]
@@ -114,7 +134,7 @@ pub async fn execute_switch_v1(
     request: ExecuteSwitchRequest,
 ) -> Result<ExecuteSwitchResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.execute_switch(request)).await
+    run_admitted_blocking(facade, move |facade| facade.execute_switch(request)).await
 }
 
 #[tauri::command]
@@ -123,7 +143,7 @@ pub async fn query_switch_operation_v1(
     request: QuerySwitchOperationRequest,
 ) -> Result<QuerySwitchOperationResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.query_switch_operation(request)).await
+    run_admitted_blocking(facade, move |facade| facade.query_switch_operation(request)).await
 }
 
 #[tauri::command]
@@ -132,7 +152,7 @@ pub async fn list_switch_recoveries_v1(
     request: ListSwitchRecoveriesRequest,
 ) -> Result<ListSwitchRecoveriesResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.list_switch_recoveries(request)).await
+    run_admitted_blocking(facade, move |facade| facade.list_switch_recoveries(request)).await
 }
 
 #[tauri::command]
@@ -141,7 +161,7 @@ pub async fn recover_switch_v1(
     request: RecoverSwitchRequest,
 ) -> Result<RecoverSwitchResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.recover_switch(request)).await
+    run_admitted_blocking(facade, move |facade| facade.recover_switch(request)).await
 }
 
 #[tauri::command]
@@ -150,7 +170,7 @@ pub async fn probe_connection_v1(
     request: ProbeConnectionRequest,
 ) -> Result<ProbeConnectionResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.probe_connection(request)).await
+    run_admitted_blocking(facade, move |facade| facade.probe_connection(request)).await
 }
 
 #[tauri::command]
@@ -159,21 +179,31 @@ pub async fn discover_models_v1(
     request: DiscoverModelsRequest,
 ) -> Result<DiscoverModelsResponse, ErrorEnvelope> {
     let facade = facade.inner().clone();
-    run_blocking(move || facade.discover_models(request)).await
+    run_admitted_blocking(facade, move |facade| facade.discover_models(request)).await
+}
+
+struct TauriExitSink(tauri::AppHandle);
+
+impl ExitSink for TauriExitSink {
+    fn exit(&self, code: i32) {
+        self.0.exit(code);
+    }
 }
 
 #[tauri::command]
-pub fn request_app_exit_v1(
+pub async fn request_app_exit_v1(
     app: tauri::AppHandle,
     facade: tauri::State<'_, ApplicationFacade>,
     request: RequestAppExitRequest,
 ) -> Result<RequestAppExitResponse, ErrorEnvelope> {
-    let response = facade.prepare_app_exit(request)?;
-    app.exit(0);
-    Ok(response)
+    let facade = facade.inner().clone();
+    let exit_sink = TauriExitSink(app);
+    run_blocking(move || facade.request_app_exit_with_sink(request, EXIT_DRAIN_TIMEOUT, &exit_sink))
+        .await
 }
 
 pub fn registered_handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
+    debug_assert_eq!(ADMISSION_EXEMPT_COMMANDS.len(), 3);
     tauri::generate_handler![
         describe_contract_v1,
         cancel_operation_v1,

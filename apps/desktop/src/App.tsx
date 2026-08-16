@@ -9,10 +9,10 @@ import { StatusFeedback } from './components/StatusFeedback';
 import { SwitchWorkflow } from './components/SwitchWorkflow';
 import { superviseOperationStatusListener } from './event-channel';
 import { SUPPORTED_LOCALES, type SupportedLocale } from './i18n';
-import { cancelOperation, createPresetAndBind, discoverModels, executeSwitch, importCandidate, listIdentities, listSwitchRecoveries, listenOperationStatus, listPresets, operationId, previewSwitch, probeConnection, querySwitchOperation, recoverSwitch, renameIdentity, requestAppExit, SafeIpcError, scanDefaultCodex, updatePresetAndBind, type EndpointPolicy, type IdentitySummary, type ModelCandidate, type PresetSummary } from './ipc';
+import { cancelOperation, createPresetAndBind, discoverModels, executeSwitch, importCandidate, listIdentities, listSwitchRecoveries, listenOperationStatus, listPresets, operationId, previewSwitch, probeConnection, querySwitchOperation, recoverSwitch, renameIdentity, requestAppExit, SafeIpcError, scanDefaultCodex, updatePresetAndBind, type EndpointPolicy, type IdentitySummary, type PresetSummary } from './ipc';
 import { createInitialM33State, m33Reducer } from './m33-state';
 import { createInitialM34State, m34Reducer, persistPendingSwitchOperation, readPendingSwitchOperation } from './m34-state';
-import { createInitialM35State, m35Reducer } from './m35-state';
+import { candidateSaveIdentity, createInitialM35State, identityProvenance, m35Reducer, sameIdentityProvenance, type OperationProvenance, type ProvenancedModelCandidate } from './m35-state';
 import { type DisplayState, type LocalePreference, type NavigationDestination } from './shell-state';
 import { useShell } from './state';
 import './styles.css';
@@ -27,13 +27,17 @@ export function App() {
   const [m35, dispatchM35] = useReducer(m35Reducer, undefined, createInitialM35State);
   const [selectedIdentityId, setSelectedIdentityId] = useState<string | null>(null);
   const [mutating, setMutating] = useState(false);
-  const [exiting, setExiting] = useState(false);
+  const [exitState, setExitState] = useState<'idle' | 'requesting' | 'draining'>('idle');
   const requestToken = useRef(0);
   const switchRequestToken = useRef(0);
   const mounted = useRef(true);
   const connectionRequestToken = useRef(0);
   const connectionOperation = useRef<string | null>(null);
+  const selectedIdentityIdRef = useRef<string | null>(null);
   const navigate = (destination: NavigationDestination) => dispatch({ type: 'navigate', destination });
+  selectedIdentityIdRef.current = selectedIdentityId;
+  const selectedIdentity = m33.identities.items.find((item) => item.identityId === selectedIdentityId) ?? null;
+  const selectedPreset = m33.presets.items.find((item) => item.isDefault) ?? null;
 
   const fail = (token: number, error: unknown) => {
     if (!mounted.current) return;
@@ -46,11 +50,14 @@ export function App() {
       const items = await listIdentities();
       if (!mounted.current) return;
       dispatchM33({ type: 'identities-finished', requestToken: token, items });
-      setSelectedIdentityId((current) => items.some((item) => item.identityId === current) ? current : items[0]?.identityId ?? null);
+      setSelectedIdentityId((current) => {
+        const next = items.some((item) => item.identityId === current) ? current : items[0]?.identityId ?? null;
+        selectedIdentityIdRef.current = next;
+        return next;
+      });
     } catch (error) { fail(token, error); }
   };
   const loadPresets = async (identityId: string) => {
-    setSelectedIdentityId(identityId);
     const token = ++requestToken.current;
     dispatchM33({ type: 'presets-started', requestToken: token, identityId });
     try {
@@ -85,6 +92,13 @@ export function App() {
   }, []);
   useEffect(() => { dispatchM33({ type: 'locale-changed' }); }, [state.locale]);
   useEffect(() => { if (selectedIdentityId) void loadPresets(selectedIdentityId); }, [selectedIdentityId]);
+  useEffect(() => {
+    const token = ++connectionRequestToken.current;
+    const previousOperation = connectionOperation.current;
+    connectionOperation.current = null;
+    dispatchM35({ type: 'identity-changed', requestToken: token, provenance: selectedIdentity ? identityProvenance(selectedIdentity) : null });
+    if (previousOperation) void cancelOperation(previousOperation).catch(() => undefined);
+  }, [selectedIdentity?.identityId, selectedIdentity?.credentialRefId, selectedIdentity?.version]);
 
   const runScan = async () => {
     const token = ++requestToken.current;
@@ -111,57 +125,78 @@ export function App() {
     setMutating(true);
     try {
       if (preset) await updatePresetAndBind(identity, preset, name, modelId); else await createPresetAndBind(identity, name, modelId);
-      await refreshIdentities(); await loadPresets(identity.identityId);
+      await refreshIdentities();
+      if (selectedIdentityIdRef.current === identity.identityId) await loadPresets(identity.identityId);
       dispatch({ type: 'notify', tone: 'success', messageKey: 'm33.notification.presetSaved' });
     } catch (error) { fail(m33.requestToken, error); }
     finally { if (mounted.current) setMutating(false); }
   };
-  const selectedIdentity = m33.identities.items.find((item) => item.identityId === selectedIdentityId) ?? null;
-  const selectedPreset = m33.presets.items.find((item) => item.isDefault) ?? null;
-  const failConnection = (token: number, error: unknown) => {
+  const failConnection = (token: number, provenance: OperationProvenance, currentOperation: string, error: unknown) => {
+    if (connectionOperation.current === currentOperation) connectionOperation.current = null;
     if (!mounted.current) return;
     const safe = error instanceof SafeIpcError ? error : new SafeIpcError('internal');
-    dispatchM35({ type: 'request-failed', requestToken: token, code: safe.code, retryable: safe.retryable });
-    connectionOperation.current = null;
+    dispatchM35({ type: 'request-failed', requestToken: token, provenance, code: safe.code, retryable: safe.retryable });
   };
   const runProbe = async (policy: EndpointPolicy) => {
     if (!selectedIdentity) return;
+    const baseProvenance = identityProvenance(selectedIdentity);
+    if (!sameIdentityProvenance(m35.identityProvenance, baseProvenance)) {
+      dispatchM35({ type: 'identity-changed', requestToken: ++connectionRequestToken.current, provenance: baseProvenance });
+    }
+    const provenance: OperationProvenance = { ...baseProvenance, endpointPolicy: policy };
     const token = ++connectionRequestToken.current;
     const currentOperation = operationId();
     connectionOperation.current = currentOperation;
-    dispatchM35({ type: 'probe-started', requestToken: token, operationId: currentOperation });
+    dispatchM35({ type: 'probe-started', requestToken: token, operationId: currentOperation, provenance });
     try {
       await probeConnection(selectedIdentity, policy, currentOperation);
-      if (mounted.current) dispatchM35({ type: 'probe-finished', requestToken: token });
+      if (mounted.current) dispatchM35({ type: 'probe-finished', requestToken: token, provenance });
       if (connectionOperation.current === currentOperation) connectionOperation.current = null;
-    } catch (error) { failConnection(token, error); }
+    } catch (error) { failConnection(token, provenance, currentOperation, error); }
   };
   const runDiscovery = async (policy: EndpointPolicy) => {
     if (!selectedIdentity) return;
+    const baseProvenance = identityProvenance(selectedIdentity);
+    if (!sameIdentityProvenance(m35.identityProvenance, baseProvenance)) {
+      dispatchM35({ type: 'identity-changed', requestToken: ++connectionRequestToken.current, provenance: baseProvenance });
+    }
+    const provenance: OperationProvenance = { ...baseProvenance, endpointPolicy: policy };
     const token = ++connectionRequestToken.current;
     const currentOperation = operationId();
     connectionOperation.current = currentOperation;
-    dispatchM35({ type: 'discovery-started', requestToken: token, operationId: currentOperation });
+    dispatchM35({ type: 'discovery-started', requestToken: token, operationId: currentOperation, provenance });
     try {
       const models = await discoverModels(selectedIdentity, policy, currentOperation);
-      if (mounted.current) dispatchM35({ type: 'discovery-finished', requestToken: token, models });
+      if (mounted.current) dispatchM35({ type: 'discovery-finished', requestToken: token, provenance, models });
       if (connectionOperation.current === currentOperation) connectionOperation.current = null;
-    } catch (error) { failConnection(token, error); }
+    } catch (error) { failConnection(token, provenance, currentOperation, error); }
   };
   const cancelConnection = async () => {
-    if (!connectionOperation.current) return;
-    try { dispatchM35({ type: 'cancel-finished', outcome: await cancelOperation(connectionOperation.current) }); }
-    catch (error) { failConnection(m35.requestToken, error); }
+    const currentOperation = connectionOperation.current;
+    const provenance = m35.requestProvenance;
+    const token = m35.requestToken;
+    if (!currentOperation || !provenance) return;
+    try { dispatchM35({ type: 'cancel-finished', requestToken: token, provenance, outcome: await cancelOperation(currentOperation) }); }
+    catch (error) {
+      failConnection(token, provenance, currentOperation, error);
+    }
   };
-  const useCandidate = async (model: ModelCandidate) => {
-    if (!selectedIdentity) return;
-    await savePreset(selectedIdentity, null, model.displayName ?? model.modelId, model.modelId);
+  const useCandidate = async (model: ProvenancedModelCandidate) => {
+    const currentIdentity = selectedIdentityIdRef.current === selectedIdentity?.identityId ? selectedIdentity : null;
+    const identity = candidateSaveIdentity(currentIdentity, model);
+    if (!identity) {
+      const token = ++connectionRequestToken.current;
+      dispatchM35({ type: 'identity-changed', requestToken: token, provenance: currentIdentity ? identityProvenance(currentIdentity) : null });
+      dispatch({ type: 'notify', tone: 'info', messageKey: 'm35.provenanceMismatch' });
+      return;
+    }
+    await savePreset(identity, null, model.displayName ?? model.modelId, model.modelId);
   };
   const exitApplication = async () => {
-    if (exiting) return;
-    setExiting(true);
+    if (exitState === 'requesting') return;
+    setExitState('requesting');
     try { await requestAppExit(); }
-    catch { if (mounted.current) { setExiting(false); dispatch({ type: 'notify', tone: 'info', messageKey: 'm35.exit.busy' }); } }
+    catch { if (mounted.current) { setExitState('draining'); dispatch({ type: 'notify', tone: 'info', messageKey: 'm35.exit.busy' }); } }
   };
   const failSwitch = (token: number, error: unknown) => {
     if (!mounted.current) return;
@@ -208,8 +243,9 @@ export function App() {
       if (mounted.current) dispatchM34({ type: 'recoveries-finished', recoveries });
     } catch (error) { failSwitch(token, error); }
   };
-  const busy = mutating || m33.scan.status === 'scanning' || m33.identities.status === 'loading' || m33.presets.status === 'loading';
-  const switchBusy = ['previewing', 'executing', 'cancelling', 'cancel_too_late'].includes(m34.status);
+  const exiting = exitState !== 'idle';
+  const busy = exiting || mutating || m33.scan.status === 'scanning' || m33.identities.status === 'loading' || m33.presets.status === 'loading';
+  const switchBusy = exiting || ['previewing', 'executing', 'cancelling', 'cancel_too_late'].includes(m34.status);
 
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">{t('a11y.skipToContent')}</a>
@@ -221,7 +257,7 @@ export function App() {
       <nav aria-label={t('nav.label')}>
         {destinations.map((destination) => <button key={destination} className="nav-item" aria-current={state.navigation === destination ? 'page' : undefined} onClick={() => navigate(destination)}>{t(`nav.${destination === 'status-lab' ? 'statusLab' : destination}`)}</button>)}
       </nav>
-      <div className="sidebar__footer"><p className="sidebar__boundary">{t('footer.boundary')}</p><Button type="button" variant="quiet" disabled={exiting} onClick={exitApplication}>{t(exiting ? 'm35.exit.waiting' : 'm35.exit.action')}</Button></div>
+      <div className="sidebar__footer"><p className="sidebar__boundary">{t('footer.boundary')}</p><Button type="button" variant="quiet" disabled={exitState === 'requesting'} onClick={exitApplication}>{t(exitState === 'idle' ? 'm35.exit.action' : exitState === 'requesting' ? 'm35.exit.waiting' : 'm35.exit.retry')}</Button></div>
     </aside>
     <main id="main-content" tabIndex={-1}>
       <div className="page-heading"><h1>{t('shell.title')}</h1><span>{t('shell.subtitle')}</span></div>

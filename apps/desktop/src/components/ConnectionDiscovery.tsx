@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import type { EndpointPolicy, IdentitySummary, ModelCandidate } from '../ipc';
-import type { M35State } from '../m35-state';
+import type { EndpointPolicy, IdentitySummary } from '../ipc';
+import type { M35State, ProvenancedModelCandidate } from '../m35-state';
 import { Button } from './Button';
 
 interface Props {
   identity: IdentitySummary | null; state: M35State; busy: boolean; t: (key: string) => string;
   onProbe: (policy: EndpointPolicy) => void; onDiscover: (policy: EndpointPolicy) => void;
-  onCancel: () => void; onUseModel: (model: ModelCandidate) => Promise<void>;
+  onCancel: () => void; onUseModel: (model: ProvenancedModelCandidate) => Promise<void>;
 }
 
 export function ConnectionDiscovery({ identity, state, busy, t, onProbe, onDiscover, onCancel, onUseModel }: Props) {
