@@ -4,6 +4,7 @@ mod error;
 mod events;
 mod m33;
 mod m34;
+mod m35;
 
 use std::sync::{Arc, Mutex};
 
@@ -23,12 +24,14 @@ pub use events::{
 };
 pub use m33::*;
 pub use m34::*;
+pub use m35::*;
 
 pub struct ApplicationFacade {
     operations: Arc<Mutex<OperationRegistry>>,
     events: Arc<dyn EventSink>,
     m33: Arc<dyn M33Backend>,
     m34: Arc<dyn M34Backend>,
+    m35: Arc<dyn M35Backend>,
 }
 
 impl Clone for ApplicationFacade {
@@ -38,6 +41,7 @@ impl Clone for ApplicationFacade {
             events: Arc::clone(&self.events),
             m33: Arc::clone(&self.m33),
             m34: Arc::clone(&self.m34),
+            m35: Arc::clone(&self.m35),
         }
     }
 }
@@ -63,10 +67,11 @@ impl Default for ApplicationFacade {
 impl ApplicationFacade {
     #[must_use]
     pub fn new(events: Arc<dyn EventSink>) -> Self {
-        Self::with_backends(
+        Self::with_all_backends(
             events,
             Arc::new(UnavailableM33Backend),
             Arc::new(UnavailableM34Backend),
+            Arc::new(UnavailableM35Backend),
         )
     }
 
@@ -81,11 +86,22 @@ impl ApplicationFacade {
         m33: Arc<dyn M33Backend>,
         m34: Arc<dyn M34Backend>,
     ) -> Self {
+        Self::with_all_backends(events, m33, m34, Arc::new(UnavailableM35Backend))
+    }
+
+    #[must_use]
+    pub fn with_all_backends(
+        events: Arc<dyn EventSink>,
+        m33: Arc<dyn M33Backend>,
+        m34: Arc<dyn M34Backend>,
+        m35: Arc<dyn M35Backend>,
+    ) -> Self {
         Self {
             operations: Arc::new(Mutex::new(OperationRegistry::default())),
             events,
             m33,
             m34,
+            m35,
         }
     }
 
@@ -118,6 +134,14 @@ impl ApplicationFacade {
         request: CancelOperationRequest,
     ) -> Result<CancelOperationResponse, ErrorEnvelope> {
         ensure_version(request.schema_version)?;
+        if let Some(outcome) = self.m35.cancel_operation(request.operation_id.as_str()) {
+            return Ok(CancelOperationResponse {
+                schema_version: M31_CONTRACT_VERSION,
+                operation_id: request.operation_id,
+                correlation_id: request.correlation_id,
+                outcome,
+            });
+        }
         let outcome = self
             .operations
             .lock()
@@ -227,7 +251,7 @@ impl ApplicationFacade {
     }
 }
 
-fn ensure_version(version: u16) -> Result<(), ErrorEnvelope> {
+pub(super) fn ensure_version(version: u16) -> Result<(), ErrorEnvelope> {
     if version == M31_CONTRACT_VERSION {
         Ok(())
     } else {

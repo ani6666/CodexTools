@@ -6,6 +6,8 @@ mod dpapi;
 mod job;
 mod secure_path;
 mod sensitive_temp;
+#[cfg(target_os = "windows")]
+mod single_instance;
 
 pub use credential_store::WindowsDpapiCredentialStore;
 pub use dpapi::DpapiCurrentUser;
@@ -17,4 +19,8 @@ pub use secure_path::{
 pub use sensitive_temp::{
     FileIdentity128, PinnedLiveFile, RelativePathObservation, RootNamespacePin,
     SensitiveHandleState, SensitiveTempFile, probe_sensitive_temp_capabilities,
+};
+#[cfg(target_os = "windows")]
+pub use single_instance::{
+    InstanceActivationStatus, InstanceStartupDisposition, WindowsInstanceStartupGate,
 };

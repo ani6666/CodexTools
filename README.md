@@ -38,6 +38,14 @@ M3.4 复用 M2.5 `VerticalSwitchPlanner::preview_from_store` 与 `execute_approv
 
 React 在既有身份与预设管理下增加 preview 摘要、明确确认、进度、取消太晚、冲突和恢复状态。中英文资源、`aria-live`、`aria-busy`、原生 `progress`、键盘和窄窗均保持；浏览器 storage 只保存 opaque pending operation id。capability 仍精确为 `core:event:allow-listen` 与 `core:event:allow-unlisten`，没有新增依赖、plugin、event emit、网络或 schema migration。合同入口为 `pwsh -NoProfile -File .\tests\M34IdentitySwitch.Tests.ps1`、`cargo test -p codextools-desktop --test m34_contract --all-features`、`cargo test -p codextools-desktop --lib m34_backend --all-features` 与 `npm test`。
 
+### M3.5 手动连接、单实例与桌面闭环
+
+M3.5 将已放行的 M2.8 `SafeModelDiscoveryService` 接入 M3 facade 与集中 Tauri command。前端只提交 identity/credential reference、expected identity version、opaque operation id 和显式 endpoint policy；Authorization、token、credential document、响应原文和真实路径始终留在 Rust 后端。测试连接与模型发现只由按钮触发，不在 mount、刷新、语言变化或后台定时器中联网。默认策略为 `PublicHttps`；`LoopbackDevelopment` 必须手动选择并显示风险提示。候选经 M2.8 bounded/deduplicated/stable sort 后返回，选择候选仍通过 M2.7 单次 create-and-bind 原子服务保存。
+
+网络 command 继续通过 `spawn_blocking` 离开 UI 线程；production backend 使用最多 32 项的有界 operation registry，并直接复用 M2.8 `CancellationController` 的 single-delivery/TooLate 语义。窗口关闭只隐藏主窗口并请求取消网络操作，不终止已进入 M2 原子临界区的切换；侧栏提供明确的“安全退出”，只有网络 worker 与 M3 operation registry 全部收敛后才调用原生退出。React request token 会忽略迟到旧结果；ErrorBoundary 只显示固定中英文恢复页，不渲染 exception message/stack。
+
+桌面单实例使用官方 `tauri-plugin-single-instance` 2.4.3；Windows 在插件 setup 前另以现有 `windows-platform` 的命名 mutex + ready event 关闭“主锁已取得但插件消息窗尚未创建”的启动竞态，第二实例等待 setup barrier 或 fail closed，绝不继续创建业务窗口。第二实例的 argv/cwd/env 不读取、不记录、不转发，激活只向官方插件发送固定空 payload，再尝试 show/unminimize/focus 已有 `main` 窗口；不会触发退出、扫描、联网或切换。capability 仍精确为 event listen/unlisten 两项，没有 shell/fs/http/process/global-shortcut 权限。真实 helper process 测试覆盖唯一主实例、无固定 sleep 的 barrier、快速退出与 crash 后锁恢复；native harness 则在 fresh test process 中使用独立 SQLite、Windows DPAPI 合成材料和受控 loopback server 驱动 production backend，不读取真实 Codex 根或访问外网。合同入口为 `pwsh -NoProfile -File .\tests\M35DesktopClosure.Tests.ps1`、`cargo test -p codextools-desktop --test m35_contract --all-features`、`cargo test -p codextools-desktop --lib m35_backend --all-features` 与 `npm test`。
+
 ### M3.0 依赖、许可证与体积评估
 
 直接新增依赖均在锁文件中精确解析：
@@ -51,10 +59,11 @@ React 在既有身份与预设管理下增加 preview 摘要、明确确认、�
 | `typescript` 6.0.3 | 严格静态类型检查 | Apache-2.0 | npm 包解压约 24.3 MB，仅开发时使用 | 7.x 是更新主版本；M3.0 选择 6.x 以降低初始 Tauri/Vite 骨架的工具链新主版本叠加风险 |
 | `@types/react` / `@types/react-dom` 19.x | React 19 TypeScript 类型 | MIT | 仅开发与类型检查使用，不进入前端 bundle | 手写声明会重复上游类型且容易漂移 |
 | `@tauri-apps/api` 2.11.0 | 仅提供官方 tree-shakeable `core.invoke` 与 `event.listen`，连接版本化 M3.3 commands/events | MIT OR Apache-2.0 | 新增 1 个 direct npm package；不引入原生 plugin，实际 gzip bundle 增量在验证报告中记录 | 手写 `window.__TAURI_INTERNALS__` 会依赖私有 API；通用 fs/shell/http plugins 会扩大权限且不需要 |
+| `tauri-plugin-single-instance` 2.4.3 | 使用 Tauri 官方跨平台单实例生命周期与激活回调；Windows 的最小启动门禁只补足插件消息窗创建前的竞态 | MIT OR Apache-2.0 | Cargo.lock 新增 43 个跨平台传递包；门禁复用已锁定 `windows-sys` 0.61.2，仅增加 Win32 feature、无新 package/capability；Windows exe 实测增量在 checkpoint 报告记录 | 完全自建跨平台单实例会复制官方生命周期；只做前端锁无法阻止第二进程 |
 
 M3.1 仅将锁文件中已有的 `serde` 1.0.229（MIT OR Apache-2.0）提升为桌面 crate 的直接生产依赖，用于 typed IPC DTO；`serde_json` 1.0.151（MIT OR Apache-2.0）仅作为合同测试开发依赖。两者均已由 Tauri/M2 依赖图锁定，因此没有新增锁定包、没有前端 bundle 增量；替代的手写 JSON/序列化会重复成熟实现并削弱 schema/roundtrip 测试。
 
-本机验证工具链为 Node.js 24.14.0、npm 11.12.1、Rust/Cargo 1.97.1（MSVC）。Vite 8 要求 Node.js `^20.19.0 || >=22.12.0`；Tauri 2.11.5 与 `tauri-build` 2.6.3 的 MSRV 为 Rust 1.77.2。仓库仍声明 Rust 1.85；`cargo generate-lockfile` 已按 Rust 1.85 选择兼容传递版本，未抬高现有 crates 的 MSRV。单实例只做后续评估，本阶段未添加 single-instance plugin 或行为。
+本机验证工具链为 Node.js 24.14.0、npm 11.12.1、Rust/Cargo 1.97.1（MSVC）。Vite 8 要求 Node.js `^20.19.0 || >=22.12.0`；Tauri 2.11.5、`tauri-build` 2.6.3 与 single-instance plugin 2.4.3 的 MSRV 均不高于 Rust 1.77.2。仓库仍声明 Rust 1.85；锁文件按 Rust 1.85 选择兼容传递版本，未抬高现有 crates 的 MSRV。
 
 M1 Codex 格式与路径预研已经用 PowerShell 7/.NET 零依赖探针和脱敏固定样本固化。M2.5 在 M2.2-M2.4 核心之上增加无正式 UI 的 Rust 两阶段纵向入口：`preview_from_store` 在短 owner 内生成不含正文的 approved intent并在返回前释放锁，调用方确认后由 `execute_approved` 重新取得 owner、重新读取 CurrentUser DPAPI 与 metadata、逐字段重算一致后才切换。切换事务的 auth 恢复快照同样使用绑定 root/transaction/source 证据的 CurrentUser-DPAPI envelope；普通切换与回滚的 config/auth 临时文件共用 schema v10 持久 owner 和 Windows 持续句柄原语：首个字节前记录 owner，root namespace 由无 delete-share 的目录句柄钉住，文件以 VolumeSerial/FileId128 绑定；初始 `CreateFileW` 原子携带 `FILE_FLAG_DELETE_ON_CLOSE`，durable identity 后通过同句柄和固定 root handle 的相对 hard-link 交接到规范 temp，再由同一句柄写入、校验、相对 rename 或 disposition cleanup。pre-v10/v1 内部草稿只做脱敏只读诊断并 fail closed，不自动解析、迁移或删除。short write、flush、sync、重读、rename 不确定结果与 readonly destination 均可重开收敛，未知 identity/reparse 原样保留并阻断。committed/rolled_back 后通过可重开 cleanup intent 清除全部事务材料。A/B 连续 100 次均执行 prewrite preview→批准执行→原路径重读，DPAPI 前向读取共 200 次，逐轮终态事务目录为零，随后恢复初始联合状态。
 
@@ -96,7 +105,12 @@ pwsh -NoProfile -File .\tests\M30DesktopSkeleton.Tests.ps1
 pwsh -NoProfile -File .\tests\M31ApplicationFacade.Tests.ps1
 pwsh -NoProfile -File .\tests\M32ReactShell.Tests.ps1
 pwsh -NoProfile -File .\tests\M33DesktopIdentity.Tests.ps1
+pwsh -NoProfile -File .\tests\M34IdentitySwitch.Tests.ps1
+pwsh -NoProfile -File .\tests\M35DesktopClosure.Tests.ps1
 cargo test -p codextools-desktop --test m33_contract --all-features
+cargo test -p codextools-desktop --test m34_contract --all-features
+cargo test -p codextools-desktop --test m35_contract --all-features
+cargo test -p codextools-desktop --lib m35_backend --all-features
 Push-Location .\apps\desktop
 npm ci --ignore-scripts
 npm test

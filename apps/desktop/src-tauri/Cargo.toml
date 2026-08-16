@@ -24,6 +24,7 @@ codex-domain = { path = "../../../crates/codex-domain" }
 local-infrastructure = { path = "../../../crates/local-infrastructure" }
 serde = { version = "=1.0.229", features = ["derive"] }
 tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-single-instance = { version = "=2.4.3", features = [] }
 windows-platform = { path = "../../../crates/windows-platform" }
 
 [dev-dependencies]

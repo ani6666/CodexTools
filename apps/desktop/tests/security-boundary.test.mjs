@@ -39,7 +39,7 @@ test('M3.3 前端 IPC 仍不建立秘密材料或真实路径入口', async () =
   }
 });
 
-test('M3.3 snapshot 与当前 M3.4 均只通过集中 typed command adapter 暴露必要命令', async () => {
+test('M3.3 snapshot 与当前 M3.5 均只通过集中 typed command adapter 暴露必要命令', async () => {
   const rustRoot = path.join(desktopRoot, 'src-tauri', 'src');
   const rustFiles = await listFiles(rustRoot);
   const commandLocations = [];
@@ -89,7 +89,10 @@ test('M3.3 snapshot 与当前 M3.4 均只通过集中 typed command adapter 暴�
     'query_switch_operation_v1',
     'list_switch_recoveries_v1',
     'recover_switch_v1',
+    'probe_connection_v1',
+    'discover_models_v1',
+    'request_app_exit_v1',
   ]);
-  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 14);
+  assert.equal((commands.match(/#\[tauri::command\]/g) ?? []).length, 17);
   assert.doesNotMatch(commands, /PathBuf|&Path|Vec<u8>|api[_-]?key|access[_-]?token|authorization|cookie/i);
 });

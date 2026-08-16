@@ -1,13 +1,15 @@
 use crate::application_facade::{
     ApplicationFacade, CancelOperationRequest, CancelOperationResponse, CreatePresetAndBindRequest,
-    DescribeContractRequest, DescribeContractResponse, ErrorCode, ErrorEnvelope,
-    ExecuteSwitchRequest, ExecuteSwitchResponse, ImportCandidateRequest, ImportCandidateResponse,
-    ListIdentitiesRequest, ListIdentitiesResponse, ListPresetsRequest, ListPresetsResponse,
-    ListSwitchRecoveriesRequest, ListSwitchRecoveriesResponse, PresetBindingResponse,
-    PreviewSwitchRequest, PreviewSwitchResponse, QuerySwitchOperationRequest,
-    QuerySwitchOperationResponse, RecoverSwitchRequest, RecoverSwitchResponse,
-    RenameIdentityRequest, RenameIdentityResponse, ScanDefaultCodexRequest,
-    ScanDefaultCodexResponse, UpdatePresetAndBindRequest,
+    DescribeContractRequest, DescribeContractResponse, DiscoverModelsRequest,
+    DiscoverModelsResponse, ErrorCode, ErrorEnvelope, ExecuteSwitchRequest, ExecuteSwitchResponse,
+    ImportCandidateRequest, ImportCandidateResponse, ListIdentitiesRequest, ListIdentitiesResponse,
+    ListPresetsRequest, ListPresetsResponse, ListSwitchRecoveriesRequest,
+    ListSwitchRecoveriesResponse, PresetBindingResponse, PreviewSwitchRequest,
+    PreviewSwitchResponse, ProbeConnectionRequest, ProbeConnectionResponse,
+    QuerySwitchOperationRequest, QuerySwitchOperationResponse, RecoverSwitchRequest,
+    RecoverSwitchResponse, RenameIdentityRequest, RenameIdentityResponse, RequestAppExitRequest,
+    RequestAppExitResponse, ScanDefaultCodexRequest, ScanDefaultCodexResponse,
+    UpdatePresetAndBindRequest,
 };
 
 #[tauri::command]
@@ -142,7 +144,36 @@ pub async fn recover_switch_v1(
     run_blocking(move || facade.recover_switch(request)).await
 }
 
-pub fn registered_handlers<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool {
+#[tauri::command]
+pub async fn probe_connection_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: ProbeConnectionRequest,
+) -> Result<ProbeConnectionResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.probe_connection(request)).await
+}
+
+#[tauri::command]
+pub async fn discover_models_v1(
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: DiscoverModelsRequest,
+) -> Result<DiscoverModelsResponse, ErrorEnvelope> {
+    let facade = facade.inner().clone();
+    run_blocking(move || facade.discover_models(request)).await
+}
+
+#[tauri::command]
+pub fn request_app_exit_v1(
+    app: tauri::AppHandle,
+    facade: tauri::State<'_, ApplicationFacade>,
+    request: RequestAppExitRequest,
+) -> Result<RequestAppExitResponse, ErrorEnvelope> {
+    let response = facade.prepare_app_exit(request)?;
+    app.exit(0);
+    Ok(response)
+}
+
+pub fn registered_handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
     tauri::generate_handler![
         describe_contract_v1,
         cancel_operation_v1,
@@ -157,6 +188,9 @@ pub fn registered_handlers<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>
         execute_switch_v1,
         query_switch_operation_v1,
         list_switch_recoveries_v1,
-        recover_switch_v1
+        recover_switch_v1,
+        probe_connection_v1,
+        discover_models_v1,
+        request_app_exit_v1
     ]
 }

@@ -34,7 +34,9 @@ Assert-True ($application -match 'struct OperationLease' -and $application -matc
 Assert-True ($integration -match 'mixed_allowed_and_denied' -and $integration -match 'redirect' -and $integration -match 'chunked' -and $integration -match 'slowloris' -and $integration -match 'secret_canary') '集成测试覆盖 DNS、redirect、size/timeout 与 secret canary'
 Assert-True ($manifest -match 'native-tls\s*=\s*\{[^}]*version\s*=\s*"=0\.2\.18"[^}]*default-features\s*=\s*false') 'TLS 依赖精确锁定且不启用 vendored/invalid-cert feature'
 
-$desktopDiff = & git -C $root diff -- apps/desktop package.json package-lock.json 2>&1 | Out-String
+$m28Base = '0ff97c938097c084a03a8d6e8214c55dec606478'
+$m28Head = '2ad40db1c1eacb914a98613ae380c48f6353d59f'
+$desktopDiff = & git -C $root diff $m28Base $m28Head -- apps/desktop package.json package-lock.json 2>&1 | Out-String
 Assert-True ([string]::IsNullOrWhiteSpace($desktopDiff)) 'M2.8 不修改 desktop、npm、Tauri 或 capability'
 
 Write-Host "M28_CONTRACT_SUMMARY passed=$passed failed=$failed"

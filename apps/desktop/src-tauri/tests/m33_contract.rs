@@ -16,6 +16,7 @@ use codex_domain as _;
 use local_infrastructure as _;
 use serde as _;
 use tauri as _;
+use tauri_plugin_single_instance as _;
 use windows_platform as _;
 
 fn secret_canaries() -> Vec<String> {

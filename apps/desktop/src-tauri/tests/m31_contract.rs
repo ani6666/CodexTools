@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use codex_adapter as _;
 use codex_domain as _;
 use tauri as _;
+use tauri_plugin_single_instance as _;
 use windows_platform as _;
 
 use codex_application::{

@@ -9,6 +9,7 @@ pub mod application_facade;
 mod commands;
 mod m33_backend;
 mod m34_backend;
+mod m35_backend;
 
 #[derive(Clone)]
 struct TauriEventSink(tauri::AppHandle);
@@ -49,7 +50,21 @@ fn core_boundary_snapshot() -> CoreBoundarySnapshot {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _core_boundary = core_boundary_snapshot();
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "windows")]
+    let startup_gate =
+        match windows_platform::WindowsInstanceStartupGate::acquire(&context.config().identifier) {
+            Ok(windows_platform::InstanceStartupDisposition::Primary(gate)) => gate,
+            Ok(windows_platform::InstanceStartupDisposition::Secondary(_)) | Err(_) => return,
+        };
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let m33_backend = m33_backend::ProductionM33Backend::new(&app_data_dir)
@@ -57,15 +72,32 @@ pub fn run() {
             let m34_backend = m34_backend::ProductionM34Backend::new(&app_data_dir)
                 .map_err(|_| std::io::Error::other("M3.4 本地服务初始化失败"))?;
             let events = Arc::new(TauriEventSink(app.handle().clone()));
-            app.manage(application_facade::ApplicationFacade::with_backends(
+            let m35_backend = m35_backend::ProductionM35Backend::new(&app_data_dir)
+                .map_err(|_| std::io::Error::other("M3.5 连接服务初始化失败"))?;
+            app.manage(application_facade::ApplicationFacade::with_all_backends(
                 events,
                 Arc::new(m33_backend),
                 Arc::new(m34_backend),
+                Arc::new(m35_backend),
             ));
+            #[cfg(target_os = "windows")]
+            {
+                startup_gate.mark_ready()?;
+                app.manage(startup_gate);
+            }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                window
+                    .state::<application_facade::ApplicationFacade>()
+                    .cancel_network_operations();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(commands::registered_handlers())
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("Tauri 应用启动失败");
 }
 

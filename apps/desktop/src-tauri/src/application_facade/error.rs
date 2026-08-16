@@ -16,6 +16,14 @@ pub enum ErrorCode {
     PlanStale,
     CompatibilityProtected,
     Cancelled,
+    AuthRequired,
+    Forbidden,
+    RateLimited,
+    Timeout,
+    TlsFailure,
+    NetworkUnavailable,
+    InvalidResponse,
+    ResponseTooLarge,
     RecoveryRequired,
     Unavailable,
     Internal,
@@ -31,6 +39,14 @@ impl ErrorCode {
             Self::PlanStale => "error.plan_stale",
             Self::CompatibilityProtected => "error.compatibility_protected",
             Self::Cancelled => "error.cancelled",
+            Self::AuthRequired => "error.auth_required",
+            Self::Forbidden => "error.forbidden",
+            Self::RateLimited => "error.rate_limited",
+            Self::Timeout => "error.timeout",
+            Self::TlsFailure => "error.tls_failure",
+            Self::NetworkUnavailable => "error.network_unavailable",
+            Self::InvalidResponse => "error.invalid_response",
+            Self::ResponseTooLarge => "error.response_too_large",
             Self::RecoveryRequired => "error.recovery_required",
             Self::Unavailable => "error.unavailable",
             Self::Internal => "error.internal",
@@ -46,6 +62,14 @@ impl ErrorCode {
             Self::PlanStale => "操作计划已失效，请重新预览。",
             Self::CompatibilityProtected => "当前状态受兼容性保护。",
             Self::Cancelled => "操作已取消。",
+            Self::AuthRequired => "需要重新认证后才能继续。",
+            Self::Forbidden => "连接目标或访问被安全策略拒绝。",
+            Self::RateLimited => "服务请求过于频繁，请稍后重试。",
+            Self::Timeout => "连接请求超时。",
+            Self::TlsFailure => "无法建立安全连接。",
+            Self::NetworkUnavailable => "网络服务暂时不可用。",
+            Self::InvalidResponse => "服务返回了不受支持的响应。",
+            Self::ResponseTooLarge => "服务响应超过安全限制。",
             Self::RecoveryRequired => "操作需要恢复后才能继续。",
             Self::Unavailable => "本地服务暂时不可用。",
             Self::Internal => "发生内部错误。",
@@ -54,7 +78,15 @@ impl ErrorCode {
 
     #[must_use]
     pub const fn retryable(self) -> bool {
-        matches!(self, Self::Conflict | Self::PlanStale | Self::Unavailable)
+        matches!(
+            self,
+            Self::Conflict
+                | Self::PlanStale
+                | Self::Unavailable
+                | Self::RateLimited
+                | Self::Timeout
+                | Self::NetworkUnavailable
+        )
     }
 }
 
@@ -244,6 +276,29 @@ impl From<super::M34BackendError> for ErrorEnvelope {
             super::M34BackendError::RecoveryRequired => ErrorCode::RecoveryRequired,
             super::M34BackendError::Unavailable => ErrorCode::Unavailable,
             super::M34BackendError::Internal => ErrorCode::Internal,
+        };
+        Self::from_code(code)
+    }
+}
+
+impl From<super::M35BackendError> for ErrorEnvelope {
+    fn from(error: super::M35BackendError) -> Self {
+        let code = match error {
+            super::M35BackendError::Validation => ErrorCode::Validation,
+            super::M35BackendError::NotFound => ErrorCode::NotFound,
+            super::M35BackendError::Conflict => ErrorCode::Conflict,
+            super::M35BackendError::AuthRequired => ErrorCode::AuthRequired,
+            super::M35BackendError::Forbidden => ErrorCode::Forbidden,
+            super::M35BackendError::RateLimited => ErrorCode::RateLimited,
+            super::M35BackendError::Timeout => ErrorCode::Timeout,
+            super::M35BackendError::TlsFailure => ErrorCode::TlsFailure,
+            super::M35BackendError::NetworkUnavailable => ErrorCode::NetworkUnavailable,
+            super::M35BackendError::InvalidResponse => ErrorCode::InvalidResponse,
+            super::M35BackendError::ResponseTooLarge => ErrorCode::ResponseTooLarge,
+            super::M35BackendError::CompatibilityProtected => ErrorCode::CompatibilityProtected,
+            super::M35BackendError::Cancelled => ErrorCode::Cancelled,
+            super::M35BackendError::Unavailable => ErrorCode::Unavailable,
+            super::M35BackendError::Internal => ErrorCode::Internal,
         };
         Self::from_code(code)
     }

@@ -518,6 +518,7 @@ impl FaultInjector for NoSwitchFaults {
 fn identity_summary(identity: &RuntimeIdentity) -> IdentitySummaryDto {
     IdentitySummaryDto {
         identity_id: identity.id().as_str().to_owned(),
+        credential_ref_id: identity.credential().id().as_str().to_owned(),
         name: identity.name().as_str().to_owned(),
         provider_name: identity.provider_display_name().as_str().to_owned(),
         auth_mode: match identity.auth_mode() {

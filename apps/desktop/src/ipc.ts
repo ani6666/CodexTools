@@ -4,11 +4,13 @@ import { listen, type Event, type UnlistenFn } from '@tauri-apps/api/event';
 const schemaVersion = 1;
 const root = 'default_codex' as const;
 
-export type SafeErrorCode = 'validation' | 'not_found' | 'conflict' | 'plan_stale' | 'compatibility_protected' | 'cancelled' | 'recovery_required' | 'unavailable' | 'internal';
+export type SafeErrorCode = 'validation' | 'not_found' | 'conflict' | 'plan_stale' | 'compatibility_protected' | 'cancelled' | 'recovery_required' | 'unavailable' | 'auth_required' | 'forbidden' | 'rate_limited' | 'timeout' | 'tls_failure' | 'network_unavailable' | 'invalid_response' | 'response_too_large' | 'internal';
 export type ScanStatus = 'not_found' | 'candidate' | 'duplicate' | 'compatibility_protected' | 'conflict' | 'recovery_required' | 'error';
 export interface ScanCandidate { scanId: string; authMode: 'api_key' | 'o_auth' }
 export interface ScanResult { status: ScanStatus; candidate: ScanCandidate | null; existingIdentityId: string | null }
-export interface IdentitySummary { identityId: string; name: string; providerName: string; authMode: 'api_key' | 'o_auth'; status: string; defaultPresetId: string | null; version: number }
+export interface IdentitySummary { identityId: string; credentialRefId: string; name: string; providerName: string; authMode: 'api_key' | 'o_auth'; status: string; defaultPresetId: string | null; version: number }
+export type EndpointPolicy = 'public_https' | 'loopback_development';
+export interface ModelCandidate { modelId: string; displayName: string | null }
 export interface PresetSummary { presetId: string; name: string; modelId: string; version: number; isDefault: boolean }
 export type SwitchProgressStage = 'accepted' | 'queued' | 'preparing' | 'validated' | 'entering_critical' | 'committing' | 'completed' | 'cancelled' | 'conflict' | 'recovery_required' | 'failed';
 export type SwitchOperationState = 'queued' | 'preparing' | 'validated' | 'entering_critical' | 'committing' | 'completed' | 'cancelled' | 'conflict' | 'recovery_required' | 'failed';
@@ -18,16 +20,17 @@ export interface SwitchOperation { operationId: string; state: SwitchOperationSt
 export interface SwitchRecovery { recoveryId: string; state: SwitchOperationState; affectedItems: number }
 export type CancellationOutcome = 'requested' | 'already_requested' | 'unknown_operation' | 'too_late' | 'already_completed';
 
-interface ErrorEnvelope { code?: string }
+interface ErrorEnvelope { code?: string; retryable?: boolean }
 interface ScanResponse { status: ScanStatus; candidate: { scan_id: string; auth_mode: 'api_key' | 'o_auth' } | null; existing_identity_id: string | null }
-interface IdentityResponse { identities: Array<{ identity_id: string; name: string; provider_name: string; auth_mode: 'api_key' | 'o_auth'; status: string; default_preset_id: string | null; version: number }> }
+interface IdentityResponse { identities: Array<{ identity_id: string; credential_ref_id: string; name: string; provider_name: string; auth_mode: 'api_key' | 'o_auth'; status: string; default_preset_id: string | null; version: number }> }
 interface PresetResponse { presets: Array<{ preset_id: string; name: string; model_id: string; version: number; is_default: boolean }> }
 interface SwitchPreviewResponse { preview: { plan_id: string; plan_version: number; operation_id: string; identity: IdentityResponse['identities'][number]; preset: PresetResponse['presets'][number]; affected_categories: Array<'configuration' | 'authentication'>; affected_items: number; warning_codes: string[]; compatibility: 'ready' | 'compatibility_protected' } }
 interface SwitchOperationResponse { operation: { operation_id: string; state: SwitchOperationState; completed_items: number; total_items: number } }
 
 export class SafeIpcError extends Error {
   readonly code: SafeErrorCode;
-  constructor(code: SafeErrorCode) { super(code); this.code = code; }
+  readonly retryable: boolean;
+  constructor(code: SafeErrorCode, retryable = false) { super(code); this.code = code; this.retryable = retryable; }
 }
 
 function correlationId(): string { return crypto.randomUUID(); }
@@ -35,8 +38,8 @@ export function operationId(): string { return crypto.randomUUID(); }
 
 function safeError(error: unknown): never {
   const candidate = typeof error === 'object' && error !== null ? (error as ErrorEnvelope).code : undefined;
-  const allowed: SafeErrorCode[] = ['validation', 'not_found', 'conflict', 'plan_stale', 'compatibility_protected', 'cancelled', 'recovery_required', 'unavailable', 'internal'];
-  throw new SafeIpcError(allowed.includes(candidate as SafeErrorCode) ? candidate as SafeErrorCode : 'internal');
+  const allowed: SafeErrorCode[] = ['validation', 'not_found', 'conflict', 'plan_stale', 'compatibility_protected', 'cancelled', 'recovery_required', 'unavailable', 'auth_required', 'forbidden', 'rate_limited', 'timeout', 'tls_failure', 'network_unavailable', 'invalid_response', 'response_too_large', 'internal'];
+  throw new SafeIpcError(allowed.includes(candidate as SafeErrorCode) ? candidate as SafeErrorCode : 'internal', Boolean(typeof error === 'object' && error !== null && (error as ErrorEnvelope).retryable));
 }
 
 export async function scanDefaultCodex(): Promise<ScanResult> {
@@ -59,7 +62,7 @@ export async function importCandidate(scanId: string): Promise<void> {
 export async function listIdentities(): Promise<IdentitySummary[]> {
   try {
     const response = await invoke<IdentityResponse>('list_identities_v1', { request: { schema_version: schemaVersion, correlation_id: correlationId() } });
-    return response.identities.map((item) => ({ identityId: item.identity_id, name: item.name, providerName: item.provider_name, authMode: item.auth_mode, status: item.status, defaultPresetId: item.default_preset_id, version: item.version }));
+    return response.identities.map(identityFromWire);
   } catch (error) { return safeError(error); }
 }
 
@@ -67,7 +70,7 @@ export async function renameIdentity(identity: IdentitySummary, name: string): P
   try {
     const response = await invoke<{ identity: IdentityResponse['identities'][number] }>('rename_identity_v1', { request: { schema_version: schemaVersion, correlation_id: correlationId(), identity_id: identity.identityId, expected_version: identity.version, name } });
     const item = response.identity;
-    return { identityId: item.identity_id, name: item.name, providerName: item.provider_name, authMode: item.auth_mode, status: item.status, defaultPresetId: item.default_preset_id, version: item.version };
+    return identityFromWire(item);
   } catch (error) { return safeError(error); }
 }
 
@@ -91,7 +94,28 @@ export async function updatePresetAndBind(identity: IdentitySummary, preset: Pre
 }
 
 function identityFromWire(item: IdentityResponse['identities'][number]): IdentitySummary {
-  return { identityId: item.identity_id, name: item.name, providerName: item.provider_name, authMode: item.auth_mode, status: item.status, defaultPresetId: item.default_preset_id, version: item.version };
+  return { identityId: item.identity_id, credentialRefId: item.credential_ref_id, name: item.name, providerName: item.provider_name, authMode: item.auth_mode, status: item.status, defaultPresetId: item.default_preset_id, version: item.version };
+}
+
+function networkRequest(identity: IdentitySummary, endpointPolicy: EndpointPolicy, operationIdValue: string) {
+  return { schema_version: schemaVersion, correlation_id: correlationId(), identity_id: identity.identityId, credential_ref_id: identity.credentialRefId, expected_identity_version: identity.version, endpoint_policy: endpointPolicy, operation_id: operationIdValue };
+}
+
+export async function probeConnection(identity: IdentitySummary, endpointPolicy: EndpointPolicy, operationIdValue: string): Promise<void> {
+  try { await invoke('probe_connection_v1', { request: networkRequest(identity, endpointPolicy, operationIdValue) }); }
+  catch (error) { safeError(error); }
+}
+
+export async function discoverModels(identity: IdentitySummary, endpointPolicy: EndpointPolicy, operationIdValue: string): Promise<ModelCandidate[]> {
+  try {
+    const response = await invoke<{ models: Array<{ model_id: string; display_name: string | null }> }>('discover_models_v1', { request: networkRequest(identity, endpointPolicy, operationIdValue) });
+    return response.models.map((model) => ({ modelId: model.model_id, displayName: model.display_name }));
+  } catch (error) { return safeError(error); }
+}
+
+export async function requestAppExit(): Promise<void> {
+  try { await invoke('request_app_exit_v1', { request: { schema_version: schemaVersion, correlation_id: correlationId() } }); }
+  catch (error) { safeError(error); }
 }
 
 function presetFromWire(item: PresetResponse['presets'][number]): PresetSummary {

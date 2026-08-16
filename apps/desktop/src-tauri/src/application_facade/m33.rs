@@ -162,6 +162,7 @@ pub struct ListIdentitiesRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IdentitySummaryDto {
     pub identity_id: String,
+    pub credential_ref_id: String,
     pub name: String,
     pub provider_name: String,
     pub auth_mode: AuthModeDto,

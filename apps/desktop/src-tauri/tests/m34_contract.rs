@@ -21,6 +21,7 @@ use codex_domain as _;
 use local_infrastructure as _;
 use serde as _;
 use tauri as _;
+use tauri_plugin_single_instance as _;
 use windows_platform as _;
 
 fn identifier(value: &str) -> SafeIdentifier {
@@ -45,6 +46,7 @@ fn backend_preview() -> BackendSwitchPreview {
         operation_id: "71717171-7171-4171-8171-717171717171".to_owned(),
         identity: IdentitySummaryDto {
             identity_id: "41414141-4141-4141-8141-414141414141".to_owned(),
+            credential_ref_id: "61616161-6161-4161-8161-616161616161".to_owned(),
             name: "Synthetic".to_owned(),
             provider_name: "Sample".to_owned(),
             auth_mode: codextools_desktop_lib::application_facade::AuthModeDto::ApiKey,
