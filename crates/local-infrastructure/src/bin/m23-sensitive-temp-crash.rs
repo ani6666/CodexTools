@@ -14,6 +14,7 @@ use codex_domain::{ModelId, ProviderId, SwitchTransactionId, UnixMillis};
 use local_infrastructure::{
     FaultInjector, SensitiveTempIo, SqliteMetadataRepository, SwitchExecutor,
 };
+use native_tls as _;
 use rusqlite as _;
 use windows_platform::{RootNamespacePin, SensitiveTempFile};
 use zeroize::{Zeroize, Zeroizing};
@@ -151,16 +152,18 @@ fn main() {
     );
     let source_config = fs::read(root.join("config.toml")).expect("source config");
     let source_auth = fs::read(root.join("auth.json")).expect("source auth");
-    let target_config = String::from_utf8(source_config.clone())
-        .expect("fixture UTF-8")
-        .replace("gpt-SAMPLE-1", "gpt-TARGET-1")
-        .replace("Sample Provider", "Target Provider")
-        .replace("https://HOST/v1", "https://TARGET/v2")
-        .into_bytes();
+    let target_config = Zeroizing::new(
+        String::from_utf8(source_config.clone())
+            .expect("fixture UTF-8")
+            .replace("gpt-SAMPLE-1", "gpt-TARGET-1")
+            .replace("Sample Provider", "Target Provider")
+            .replace("https://HOST/v1", "https://TARGET/v2")
+            .into_bytes(),
+    );
     let ScanStatus::Ready(target) = CodexAdapter::new().scan_memory(&target_config, &auth) else {
         std::process::exit(65);
     };
-    let plan = SwitchPlan::new_zeroizing_auth(
+    let plan = SwitchPlan::new_zeroizing(
         SwitchTransactionId::parse("e1000000-0000-4000-8000-000000000001").expect("id"),
         fs::canonicalize(&root).expect("canonical root"),
         FileBaseline::present(source_config.len() as u64, hash_bytes(&source_config)),

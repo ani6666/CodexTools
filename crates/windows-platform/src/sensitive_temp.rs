@@ -34,7 +34,7 @@ pub enum RelativePathObservation {
 #[cfg(windows)]
 mod imp {
     use std::{
-        ffi::OsStr,
+        ffi::{OsStr, OsString},
         fs::File,
         io::{self, Read, Seek, SeekFrom, Write},
         mem::{offset_of, size_of},
@@ -77,11 +77,35 @@ mod imp {
     const MAX_HANDLE_READ: u64 = 16 * 1024 * 1024;
     const FILE_RENAME_INFORMATION_EX: i32 = 65;
     const FILE_LINK_INFO_CLASS: i32 = 11;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const NT_FILE_OPEN: u32 = 0x0000_0001;
+    const NT_FILE_OPEN_IF: u32 = 0x0000_0003;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const NT_FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
     #[repr(C)]
     struct IoStatusBlock {
         status_or_pointer: usize,
         information: usize,
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
     }
 
     #[repr(C)]
@@ -94,6 +118,19 @@ mod imp {
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut core::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
         fn NtSetInformationFile(
             file_handle: HANDLE,
             io_status_block: *mut IoStatusBlock,
@@ -105,8 +142,17 @@ mod imp {
     }
 
     #[derive(Debug)]
-    pub struct RootNamespacePin {
+    struct NamespacePin {
         file: File,
+        identity: FileIdentity128,
+        relative_name: Option<OsString>,
+    }
+
+    #[derive(Debug)]
+    pub struct RootNamespacePin {
+        namespace_chain: Vec<NamespacePin>,
+        file: File,
+        root_component: OsString,
         root_path: PathBuf,
         final_path: PathBuf,
         identity: FileIdentity128,
@@ -115,29 +161,89 @@ mod imp {
     impl RootNamespacePin {
         pub fn acquire(root: &Path) -> io::Result<Self> {
             validate_explicit_root(root)?;
-            let canonical = std::fs::canonicalize(root)?;
-            Self::acquire_canonical(&canonical)
+            Self::acquire_components(root)
         }
 
         pub fn acquire_canonical(canonical: &Path) -> io::Result<Self> {
             validate_canonical_root(canonical)?;
-            let file = create_file(
-                canonical,
-                FILE_LIST_DIRECTORY
-                    | FILE_ADD_FILE
-                    | FILE_TRAVERSE
-                    | FILE_READ_ATTRIBUTES
-                    | GENERIC_WRITE
-                    | SYNCHRONIZE,
+            Self::acquire_components(canonical)
+        }
+
+        fn acquire_components(root: &Path) -> io::Result<Self> {
+            Self::acquire_components_with_hook(root, || {})
+        }
+
+        fn acquire_components_with_hook<F>(root: &Path, after_volume_open: F) -> io::Result<Self>
+        where
+            F: FnOnce(),
+        {
+            let components = local_disk_components(root)?;
+            if components.is_empty() {
+                return Err(invalid_data(
+                    "filesystem root is not a supported switch root",
+                ));
+            }
+            let current = local_disk_root(root)?;
+            let volume = create_file(
+                &current,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             )?;
-            let metadata = file.metadata()?;
-            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(invalid_data("root is not a non-reparse directory"));
+            verify_non_reparse_directory(&volume)?;
+            let volume_identity = file_identity(&volume)?;
+            let mut namespace_chain = vec![NamespacePin {
+                file: volume,
+                identity: volume_identity,
+                relative_name: None,
+            }];
+            after_volume_open();
+            let mut final_file = None;
+            let mut root_component = None;
+            for (index, component) in components.iter().enumerate() {
+                let is_final = index + 1 == components.len();
+                let access = if is_final {
+                    FILE_LIST_DIRECTORY
+                        | FILE_ADD_FILE
+                        | FILE_TRAVERSE
+                        | FILE_READ_ATTRIBUTES
+                        | GENERIC_WRITE
+                        | SYNCHRONIZE
+                } else {
+                    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                };
+                let parent = &namespace_chain
+                    .last()
+                    .ok_or_else(|| invalid_data("root namespace has no parent"))?
+                    .file;
+                let file = open_relative(
+                    parent,
+                    component,
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NT_FILE_OPEN,
+                    FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | NT_FILE_OPEN_REPARSE_POINT,
+                )?;
+                verify_non_reparse_directory(&file)?;
+                let identity = file_identity(&file)?;
+                if identity.volume_serial_number != volume_identity.volume_serial_number {
+                    return Err(invalid_data("root component changed filesystem volume"));
+                }
+                if is_final {
+                    final_file = Some(file);
+                    root_component = Some(component.clone());
+                } else {
+                    namespace_chain.push(NamespacePin {
+                        file,
+                        identity,
+                        relative_name: Some(component.clone()),
+                    });
+                }
             }
+            let file = final_file.ok_or_else(|| invalid_data("root has no final component"))?;
+            let root_component =
+                root_component.ok_or_else(|| invalid_data("root has no final component"))?;
             let identity = file_identity(&file)?;
             let final_path = final_path(&file)?;
             let parent = final_path
@@ -149,8 +255,10 @@ mod imp {
                 ));
             }
             Ok(Self {
+                namespace_chain,
                 file,
-                root_path: canonical.to_path_buf(),
+                root_component,
+                root_path: final_path.clone(),
                 final_path,
                 identity,
             })
@@ -176,10 +284,80 @@ mod imp {
         }
 
         pub fn verify_identity(&self) -> io::Result<()> {
+            for (index, pin) in self.namespace_chain.iter().enumerate() {
+                verify_non_reparse_directory(&pin.file)?;
+                if file_identity(&pin.file)? != pin.identity {
+                    return Err(invalid_data("root ancestor identity changed"));
+                }
+                if index > 0 {
+                    let parent = &self.namespace_chain[index - 1].file;
+                    let name = pin.relative_name.as_ref().ok_or_else(|| {
+                        invalid_data("root ancestor is missing its relative name")
+                    })?;
+                    reopen_relative_identity(parent, name, pin.identity, true)?;
+                }
+            }
+            verify_non_reparse_directory(&self.file)?;
             if file_identity(&self.file)? != self.identity {
                 return Err(invalid_data("root identity changed"));
             }
+            let parent = &self
+                .namespace_chain
+                .last()
+                .ok_or_else(|| invalid_data("root namespace has no parent"))?
+                .file;
+            reopen_relative_identity(parent, &self.root_component, self.identity, true)?;
             Ok(())
+        }
+
+        /// 在固定根目录内创建或打开跨进程写锁；不跟随锁文件 reparse，且在截断前后
+        /// 都重新核对根、父目录与文件身份。
+        pub fn open_write_lock(&self, basename: &str) -> io::Result<File> {
+            validate_basename(basename)?;
+            self.verify_identity()?;
+            let file = open_relative(
+                &self.file,
+                OsStr::new(basename),
+                GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ,
+                NT_FILE_OPEN_IF,
+                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | NT_FILE_OPEN_REPARSE_POINT,
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(invalid_data("write lock is not a non-reparse file"));
+            }
+            verify_parent_identity(&file, self)?;
+            let identity = file_identity(&file)?;
+            if identity.volume_serial_number != self.identity.volume_serial_number {
+                return Err(invalid_data("write lock volume differs from pinned root"));
+            }
+            file.set_len(0)?;
+            self.verify_identity()?;
+            verify_parent_identity(&file, self)?;
+            if file_identity(&file)? != identity {
+                return Err(invalid_data("write lock identity changed during open"));
+            }
+            Ok(file)
+        }
+
+        pub fn relative_directory_is_empty(&self, basename: &str) -> io::Result<bool> {
+            validate_basename(basename)?;
+            self.verify_identity()?;
+            let path = self.final_path.join(basename);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_dir()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    {
+                        return Err(invalid_data("relative path is not a plain directory"));
+                    }
+                    Ok(std::fs::read_dir(path)?.next().transpose()?.is_none())
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            }
         }
 
         pub fn observe_relative(
@@ -586,6 +764,65 @@ mod imp {
             })
         }
 
+        /// 为受控联合快照持有只读且禁止写入/删除共享的稳定句柄。
+        pub fn open_stable_read(root: &RootNamespacePin, basename: &str) -> io::Result<Self> {
+            validate_basename(basename)?;
+            root.verify_identity()?;
+            let file = create_file(
+                &root.final_path.join(basename),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(invalid_data("stable input is not a non-reparse file"));
+            }
+            verify_parent_identity(&file, root)?;
+            let identity = file_identity(&file)?;
+            Ok(Self {
+                file,
+                basename: basename.to_owned(),
+                identity,
+            })
+        }
+
+        /// 只读打开写锁诊断文件，同时允许既有写锁句柄继续持有写访问。
+        pub fn open_lock_diagnostic(root: &RootNamespacePin, basename: &str) -> io::Result<Self> {
+            validate_basename(basename)?;
+            root.verify_identity()?;
+            let file = create_file(
+                &root.final_path.join(basename),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(invalid_data("lock diagnostic is not a non-reparse file"));
+            }
+            verify_parent_identity(&file, root)?;
+            let identity = file_identity(&file)?;
+            Ok(Self {
+                file,
+                basename: basename.to_owned(),
+                identity,
+            })
+        }
+
+        pub fn verify_identity(&self, root: &RootNamespacePin) -> io::Result<()> {
+            root.verify_identity()?;
+            verify_parent_identity(&self.file, root)?;
+            if file_identity(&self.file)? != self.identity {
+                return Err(invalid_data("stable input identity changed"));
+            }
+            Ok(())
+        }
+
         pub fn open_for_delete(
             root: &RootNamespacePin,
             basename: &str,
@@ -820,6 +1057,43 @@ mod imp {
         Ok(())
     }
 
+    fn local_disk_root(path: &Path) -> io::Result<PathBuf> {
+        use std::path::Prefix;
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return Err(invalid_data("root has no drive prefix"));
+        };
+        let drive = match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return Err(invalid_data("root is not a local disk path")),
+        };
+        Ok(PathBuf::from(format!("{}:\\", char::from(drive))))
+    }
+
+    fn local_disk_components(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        let mut result = Vec::new();
+        for component in path.components().skip(1) {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(value) => result.push(value.to_os_string()),
+                Component::CurDir | Component::ParentDir => {
+                    return Err(invalid_data("root contains relative components"));
+                }
+                Component::Prefix(_) => {
+                    return Err(invalid_data("root contains multiple prefixes"));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn verify_non_reparse_directory(file: &File) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_data("root namespace contains a reparse directory"));
+        }
+        Ok(())
+    }
+
     fn validate_basename(name: &str) -> io::Result<()> {
         if name.is_empty()
             || name.len() > 240
@@ -888,6 +1162,96 @@ mod imp {
             return Err(io::Error::last_os_error());
         }
         Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    fn open_relative(
+        parent: &File,
+        name: &OsStr,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+    ) -> io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty() || wide.contains(&0) || wide.len() > usize::from(u16::MAX) / 2 {
+            return Err(invalid_data("relative path component is invalid"));
+        }
+        let byte_length = u16::try_from(wide.len() * 2)
+            .map_err(|_| invalid_data("relative path component is too long"))?;
+        let mut unicode = UnicodeString {
+            length: byte_length,
+            maximum_length: byte_length,
+            buffer: wide.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: u32::try_from(size_of::<ObjectAttributes>())
+                .map_err(|_| invalid_data("object attributes are too large"))?,
+            root_directory: parent.as_raw_handle() as HANDLE,
+            object_name: &mut unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: ptr::null_mut(),
+            security_quality_of_service: ptr::null_mut(),
+        };
+        let mut io_status = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let mut handle: HANDLE = ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &mut attributes,
+                &mut io_status,
+                ptr::null_mut(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                options,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            let dos = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(dos as i32));
+        }
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(invalid_data("relative open returned an invalid handle"));
+        }
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    fn reopen_relative_identity(
+        parent: &File,
+        name: &OsStr,
+        expected: FileIdentity128,
+        directory: bool,
+    ) -> io::Result<()> {
+        let options = FILE_SYNCHRONOUS_IO_NONALERT
+            | NT_FILE_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            };
+        let reopened = open_relative(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NT_FILE_OPEN,
+            options,
+        )?;
+        if directory {
+            verify_non_reparse_directory(&reopened)?;
+        } else if reopened.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_data("relative child is a reparse point"));
+        }
+        if file_identity(&reopened)? != expected {
+            return Err(invalid_data("relative child identity changed"));
+        }
+        Ok(())
     }
 
     fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
@@ -1068,25 +1432,10 @@ mod imp {
 
     fn verify_parent_identity(file: &File, root: &RootNamespacePin) -> io::Result<()> {
         let path = final_path(file)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| invalid_data("file has no final parent"))?;
-        let parent_handle = create_file(
-            parent,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )?;
-        let metadata = parent_handle.metadata()?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || file_identity(&parent_handle)? != root.identity
-        {
-            return Err(invalid_data(
-                "sensitive temp final parent identity mismatch",
-            ));
-        }
-        Ok(())
+        let basename = path
+            .file_name()
+            .ok_or_else(|| invalid_data("file has no final basename"))?;
+        reopen_relative_identity(&root.file, basename, file_identity(file)?, false)
     }
 
     fn invalid_data(message: &'static str) -> io::Error {
@@ -1094,6 +1443,79 @@ mod imp {
     }
     fn unsupported(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::Unsupported, message)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{
+            fs,
+            process::Command,
+            sync::Mutex,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        use super::*;
+
+        static SUBST_TEST: Mutex<()> = Mutex::new(());
+
+        fn run_subst(letter: char, target: Option<&Path>) -> bool {
+            let drive = format!("{letter}:");
+            let mut command = Command::new("subst.exe");
+            command.arg(&drive);
+            if let Some(target) = target {
+                command.arg(target);
+            } else {
+                command.arg("/D");
+            }
+            command.status().is_ok_and(|status| status.success())
+        }
+
+        #[test]
+        fn subst_mapping_changes_between_components_cannot_cross_parent_handle() {
+            let _serial = SUBST_TEST.lock().expect("subst test lock");
+            let letter = ('T'..='Z')
+                .rev()
+                .find(|letter| !PathBuf::from(format!("{letter}:\\")).exists())
+                .expect("an unused DOS drive letter");
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!(
+                "codextools-root-relative-{}-{nonce}",
+                std::process::id()
+            ));
+            let first = base.join("first");
+            let second = base.join("second");
+            fs::create_dir_all(first.join("child")).expect("first child");
+            fs::create_dir_all(second.join("child")).expect("second child");
+            assert!(run_subst(letter, Some(&first)), "create first DOS alias");
+
+            let expected = file_identity(
+                &create_file(
+                    &first.join("child"),
+                    FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+                .expect("open expected child"),
+            )
+            .expect("expected identity");
+            let alias_child = PathBuf::from(format!("{letter}:\\child"));
+            let pin = RootNamespacePin::acquire_components_with_hook(&alias_child, || {
+                assert!(run_subst(letter, None), "remove first DOS alias");
+                assert!(run_subst(letter, Some(&second)), "create second DOS alias");
+            })
+            .expect("root pin remains under the original parent handle");
+            assert_eq!(pin.identity(), expected);
+            pin.verify_identity()
+                .expect("relative chain remains stable");
+            drop(pin);
+
+            assert!(run_subst(letter, None), "remove second DOS alias");
+            fs::remove_dir_all(base).expect("remove subst fixture");
+        }
     }
 }
 
@@ -1105,7 +1527,7 @@ pub use imp::{
 #[cfg(not(windows))]
 mod imp_non_windows {
     use super::{FileIdentity128, SensitiveHandleState};
-    use std::{io, path::Path};
+    use std::{fs::File, io, path::Path};
 
     #[derive(Debug)]
     pub struct RootNamespacePin;
@@ -1120,6 +1542,21 @@ mod imp_non_windows {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Windows sensitive-temp support is required",
+            ))
+        }
+        pub fn final_path(&self) -> &Path {
+            Path::new("")
+        }
+        pub fn relative_directory_is_empty(&self, _: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows root-relative directory validation is required",
+            ))
+        }
+        pub fn open_write_lock(&self, _: &str) -> io::Result<File> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows no-follow write locks are required",
             ))
         }
     }
@@ -1138,6 +1575,44 @@ mod imp_non_windows {
     }
     #[derive(Debug)]
     pub struct PinnedLiveFile;
+    impl PinnedLiveFile {
+        pub fn open_stable_read(_: &RootNamespacePin, _: &str) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub fn open_lock_diagnostic(_: &RootNamespacePin, _: &str) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows no-follow lock diagnostics are required",
+            ))
+        }
+        pub fn verify_identity(&self, _: &RootNamespacePin) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub const fn identity(&self) -> FileIdentity128 {
+            FileIdentity128 {
+                volume_serial_number: 0,
+                file_id: [0; 16],
+            }
+        }
+        pub fn length(&self) -> io::Result<u64> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+        pub fn reread(&mut self, _: u64) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows stable handles are required",
+            ))
+        }
+    }
     pub fn probe_sensitive_temp_capabilities(_: &RootNamespacePin) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

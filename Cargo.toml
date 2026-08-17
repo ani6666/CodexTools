@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/desktop/src-tauri",
   "crates/codex-adapter",
   "crates/codex-application",
   "crates/codex-domain",

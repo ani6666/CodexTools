@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! 只读取调用方显式提供的 Codex 目录，并只在内存中生成配置计划。
 
+mod auth;
 mod hash;
 mod json;
 mod toml;
@@ -9,60 +10,21 @@ use std::{fs, path::Path};
 
 use codex_application::{
     ActualCodexState, AuthenticationDescriptor, CodexStateSource, CompatibilityReason,
-    ConfigPlanner, DesiredManagedConfig, FormatGeneration, ManagedFieldChange, PlannedConfig,
-    RedactedDiff, ScanStatus, ScannedConfig,
+    ConfigPlanner, ControlledCodexSource, ControlledRoot, ControlledScanId, ControlledScanStatus,
+    ControlledScanSummary, ControlledSourceError, DesiredManagedConfig, FormatGeneration,
+    ManagedFieldChange, PlannedConfig, RedactedDiff, ScanStatus, ScannedAuthConsumer,
+    ScannedConfig,
 };
 use codex_domain::{
     AuthMode, ContentHash, CredentialFingerprint, CredentialReference, EndpointUrl, EntityName,
-    ModelId, ProviderId, SchemaFingerprint,
+    ModelId, ProviderId, SchemaFingerprint, contains_high_confidence_secret_bytes,
 };
+use zeroize::{Zeroize, Zeroizing};
+
+pub use auth::CodexAuthorizationParser;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexAdapter;
-
-fn contains_high_confidence_secret(bytes: &[u8]) -> bool {
-    fn run(bytes: &[u8], allowed: impl Fn(u8) -> bool) -> usize {
-        bytes.iter().copied().take_while(|b| allowed(*b)).count()
-    }
-    let prefixed = |prefix: &[u8], minimum: usize, allowed: fn(u8) -> bool| {
-        bytes
-            .windows(prefix.len())
-            .enumerate()
-            .any(|(index, value)| {
-                value == prefix && run(&bytes[index + prefix.len()..], allowed) >= minimum
-            })
-    };
-    let token = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
-    prefixed(b"sk-", 20, token)
-        || bytes.windows(4).enumerate().any(|(index, value)| {
-            value[0..2] == *b"gh"
-                && b"pousr".contains(&value[2])
-                && value[3] == b'_'
-                && run(&bytes[index + 4..], |b| b.is_ascii_alphanumeric()) >= 20
-        })
-        || prefixed(b"AKIA", 16, |b| {
-            b.is_ascii_uppercase() || b.is_ascii_digit()
-        })
-        || bytes.windows(3).enumerate().any(|(index, value)| {
-            if value != b"eyJ" {
-                return false;
-            }
-            let first = run(&bytes[index + 3..], token);
-            let p1 = index + 3 + first;
-            if first < 8 || bytes.get(p1) != Some(&b'.') {
-                return false;
-            }
-            let second = run(&bytes[p1 + 1..], token);
-            let p2 = p1 + 1 + second;
-            second >= 8 && bytes.get(p2) == Some(&b'.') && run(&bytes[p2 + 1..], token) >= 8
-        })
-        || ["", "RSA ", "OPENSSH ", "EC ", "DSA "].iter().any(|label| {
-            let mut header = b"-----BEGIN ".to_vec();
-            header.extend_from_slice(label.as_bytes());
-            header.extend_from_slice(b"PRIVATE KEY-----");
-            bytes.windows(header.len()).any(|value| value == header)
-        })
-}
 
 impl CodexAdapter {
     #[must_use]
@@ -92,15 +54,21 @@ pub fn hash_bytes(value: &[u8]) -> ContentHash {
 impl CodexAdapter {
     #[must_use]
     pub fn scan_memory(&self, config: &[u8], auth: &[u8]) -> ScanStatus {
-        scan_bytes(config.to_vec(), auth.to_vec())
+        scan_slices(config, auth)
     }
 }
 
 fn scan_bytes(config: Vec<u8>, auth: Vec<u8>) -> ScanStatus {
-    if contains_high_confidence_secret(&config) {
+    let config = Zeroizing::new(config);
+    let auth = SensitiveAuth::new(auth);
+    scan_slices(&config, &auth)
+}
+
+fn scan_slices(config: &[u8], auth: &[u8]) -> ScanStatus {
+    if contains_high_confidence_secret_bytes(config) {
         return ScanStatus::CompatibilityProtected(CompatibilityReason::UnsupportedTomlSubset);
     }
-    let parsed = match toml::parse(&config) {
+    let parsed = match toml::parse(config) {
         Ok(v) => v,
         Err(r) => return ScanStatus::CompatibilityProtected(r),
     };
@@ -136,7 +104,7 @@ fn scan_bytes(config: Vec<u8>, auth: Vec<u8>) -> ScanStatus {
         Ok(v) => v,
         Err(r) => return ScanStatus::CompatibilityProtected(r),
     };
-    let (mode, schema) = match json::classify(&auth) {
+    let (mode, schema) = match json::classify(auth) {
         Ok(v) => v,
         Err(r) => return ScanStatus::CompatibilityProtected(r),
     };
@@ -159,8 +127,8 @@ fn scan_bytes(config: Vec<u8>, auth: Vec<u8>) -> ScanStatus {
     };
     ScanStatus::Ready(Box::new(ActualCodexState {
         config: ScannedConfig {
-            original_bytes: config.clone(),
-            baseline_sha256: hash_bytes(&config),
+            original_bytes: Zeroizing::new(config.to_vec()),
+            baseline_sha256: hash_bytes(config),
             has_bom: parsed.has_bom,
             line_ending: parsed.line_ending,
             generation,
@@ -173,10 +141,182 @@ fn scan_bytes(config: Vec<u8>, auth: Vec<u8>) -> ScanStatus {
             auth_mode,
             schema_fingerprint: SchemaFingerprint::parse(&hash::sha256_hex(schema.as_bytes()))
                 .expect("hash"),
-            credential_fingerprint: CredentialFingerprint::parse(&hash::sha256_hex(&auth))
+            credential_fingerprint: CredentialFingerprint::parse(&hash::sha256_hex(auth))
                 .expect("hash"),
         },
     }))
+}
+
+pub trait StableSnapshotConsumer {
+    fn consume(
+        &mut self,
+        config: &mut [u8],
+        auth: &mut [u8],
+        evidence: &[u8],
+    ) -> Result<(), ControlledSourceError>;
+}
+
+pub trait ControlledRootReader {
+    fn read_stable(
+        &self,
+        root: ControlledRoot,
+        consumer: &mut dyn StableSnapshotConsumer,
+    ) -> Result<(), ControlledSourceError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlledCodexAdapter<R> {
+    resolver: R,
+}
+
+impl<R> ControlledCodexAdapter<R> {
+    #[must_use]
+    pub const fn new(resolver: R) -> Self {
+        Self { resolver }
+    }
+}
+
+fn controlled_scan_id(actual: &ActualCodexState, evidence: &[u8]) -> ControlledScanId {
+    let mut digest = hash::Sha256::new();
+    digest.update(actual.config.baseline_sha256.as_str().as_bytes());
+    digest.update(b":");
+    digest.update(
+        actual
+            .authentication
+            .credential_fingerprint
+            .as_str()
+            .as_bytes(),
+    );
+    digest.update(b":");
+    digest.update(evidence);
+    let value = digest
+        .finish()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ControlledScanId::from_hash(ContentHash::parse(&value).expect("SHA-256 scan id"))
+}
+
+struct SensitiveAuth {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    observer: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+}
+
+impl SensitiveAuth {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn observed(bytes: Vec<u8>, observer: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+        Self {
+            bytes,
+            observer: Some(observer),
+        }
+    }
+}
+
+impl std::ops::Deref for SensitiveAuth {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl std::ops::DerefMut for SensitiveAuth {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bytes
+    }
+}
+
+impl Drop for SensitiveAuth {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.set(self.bytes.iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+impl<R: ControlledRootReader> ControlledCodexSource for ControlledCodexAdapter<R> {
+    fn scan(&self, root: ControlledRoot) -> ControlledScanStatus {
+        struct Scanner(Option<ControlledScanStatus>);
+        impl StableSnapshotConsumer for Scanner {
+            fn consume(
+                &mut self,
+                config: &mut [u8],
+                auth: &mut [u8],
+                evidence: &[u8],
+            ) -> Result<(), ControlledSourceError> {
+                self.0 = Some(match scan_slices(config, auth) {
+                    ScanStatus::Ready(actual) => {
+                        ControlledScanStatus::Ready(ControlledScanSummary {
+                            scan_id: controlled_scan_id(&actual, evidence),
+                            auth_mode: actual.authentication.auth_mode,
+                        })
+                    }
+                    ScanStatus::CompatibilityProtected(reason) => {
+                        ControlledScanStatus::CompatibilityProtected(reason)
+                    }
+                });
+                Ok(())
+            }
+        }
+        let mut scanner = Scanner(None);
+        match self.resolver.read_stable(root, &mut scanner) {
+            Ok(()) => scanner
+                .0
+                .unwrap_or(ControlledScanStatus::CompatibilityProtected(
+                    CompatibilityReason::IoUnavailable,
+                )),
+            Err(ControlledSourceError::CompatibilityProtected(reason)) => {
+                ControlledScanStatus::CompatibilityProtected(reason)
+            }
+            Err(_) => {
+                ControlledScanStatus::CompatibilityProtected(CompatibilityReason::IoUnavailable)
+            }
+        }
+    }
+
+    fn consume_confirmed(
+        &self,
+        root: ControlledRoot,
+        expected: &ControlledScanId,
+        consumer: &mut dyn ScannedAuthConsumer,
+    ) -> Result<(), ControlledSourceError> {
+        struct Confirmer<'a> {
+            expected: &'a ControlledScanId,
+            consumer: &'a mut dyn ScannedAuthConsumer,
+        }
+        impl StableSnapshotConsumer for Confirmer<'_> {
+            fn consume(
+                &mut self,
+                config: &mut [u8],
+                auth: &mut [u8],
+                evidence: &[u8],
+            ) -> Result<(), ControlledSourceError> {
+                let actual = match scan_slices(config, auth) {
+                    ScanStatus::Ready(actual) => actual,
+                    ScanStatus::CompatibilityProtected(reason) => {
+                        return Err(ControlledSourceError::CompatibilityProtected(reason));
+                    }
+                };
+                if &controlled_scan_id(&actual, evidence) != self.expected {
+                    return Err(ControlledSourceError::ScanChanged);
+                }
+                self.consumer.consume(&actual, auth)
+            }
+        }
+        self.resolver
+            .read_stable(root, &mut Confirmer { expected, consumer })
+    }
 }
 
 impl CodexStateSource for CodexAdapter {
@@ -237,10 +377,10 @@ impl ConfigPlanner for CodexAdapter {
                 .ok_or(CompatibilityReason::MissingManagedField)?
                 .value
                 .clone();
-            if before != *after {
+            if before.as_str() != after {
                 changes.push(ManagedFieldChange {
                     path: path.clone(),
-                    before,
+                    before: before.as_str().to_owned(),
                     after: after.clone(),
                 })
             }
@@ -266,5 +406,51 @@ impl ConfigPlanner for CodexAdapter {
             changes,
             diff: RedactedDiff::new(lines),
         })
+    }
+}
+
+#[cfg(test)]
+mod controlled_tests {
+    use std::{
+        cell::Cell,
+        panic::{AssertUnwindSafe, catch_unwind},
+        rc::Rc,
+    };
+
+    use codex_application::{ControlledSourceError, ScannedAuthConsumer};
+
+    use super::{ActualCodexState, SensitiveAuth, scan_slices};
+
+    struct PanickingConsumer;
+
+    impl ScannedAuthConsumer for PanickingConsumer {
+        fn consume(
+            &mut self,
+            _actual: &ActualCodexState,
+            _auth: &mut [u8],
+        ) -> Result<(), ControlledSourceError> {
+            panic!("synthetic consumer panic")
+        }
+    }
+
+    #[test]
+    fn sensitive_auth_zeroizes_during_unwind() {
+        let zeroized = Rc::new(Cell::new(false));
+        let observed = zeroized.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut auth = SensitiveAuth::observed(
+                b"synthetic-auth-buffer-with-secret-shape".to_vec(),
+                observed,
+            );
+            let codex_application::ScanStatus::Ready(actual) = scan_slices(
+                b"model = \"gpt-SAMPLE\"\nmodel_provider = \"sample\"\n[model_providers.sample]\nname = \"Sample\"\nbase_url = \"https://HOST/v1\"\n",
+                b"{\"OPENAI_API_KEY\":\"SAMPLE_VALUE\"}",
+            ) else {
+                panic!("synthetic state must scan")
+            };
+            PanickingConsumer.consume(&actual, &mut auth).unwrap();
+        }));
+        assert!(result.is_err());
+        assert!(zeroized.get());
     }
 }

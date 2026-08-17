@@ -5,6 +5,7 @@ use codex_domain::{
     EntityName, IdentityId, ManagedConfigPatch, ManagedConfigPatchId, ModelId, ModelPreset,
     ModelPresetId, ProviderId, RuntimeIdentity, SchemaFingerprint, UnixMillis,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     IdentityCandidateQuery, ManagedConfigPatchRepository, ModelPresetRepository, RepositoryError,
@@ -73,9 +74,9 @@ impl fmt::Debug for AuthenticationDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ScannedConfig {
-    pub original_bytes: Vec<u8>,
+    pub original_bytes: Zeroizing<Vec<u8>>,
     pub baseline_sha256: ContentHash,
     pub has_bom: bool,
     pub line_ending: LineEnding,
@@ -84,6 +85,23 @@ pub struct ScannedConfig {
     pub provider_display_name: EntityName,
     pub api_base_url: EndpointUrl,
     pub model_id: ModelId,
+}
+
+impl fmt::Debug for ScannedConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScannedConfig")
+            .field("config_bytes", &"[REDACTED_CONFIG_BYTES]")
+            .field("baseline_sha256", &self.baseline_sha256)
+            .field("has_bom", &self.has_bom)
+            .field("line_ending", &self.line_ending)
+            .field("generation", &self.generation)
+            .field("provider_id", &self.provider_id)
+            .field("provider_display_name", &self.provider_display_name)
+            .field("api_base_url", &self.api_base_url)
+            .field("model_id", &self.model_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,13 +160,26 @@ impl fmt::Debug for RedactedDiff {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PlannedConfig {
-    pub target_bytes: Vec<u8>,
+    pub target_bytes: Zeroizing<Vec<u8>>,
     pub baseline_sha256: ContentHash,
     pub target_sha256: ContentHash,
     pub changes: Vec<ManagedFieldChange>,
     pub diff: RedactedDiff,
+}
+
+impl fmt::Debug for PlannedConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannedConfig")
+            .field("target_bytes", &"[REDACTED_BYTES]")
+            .field("baseline_sha256", &self.baseline_sha256)
+            .field("target_sha256", &self.target_sha256)
+            .field("changes", &self.changes)
+            .field("diff", &self.diff)
+            .finish()
+    }
 }
 
 pub trait ConfigPlanner {
@@ -213,8 +244,19 @@ pub fn import_scanned_identity<R: IdentityBundleRepository>(
     actual: &ActualCodexState,
     input: ImportIdentityInput,
 ) -> Result<ImportOutcome, ApplicationError> {
-    let Some(credential) = input.credential else {
+    let Some(bundle) = build_scanned_identity_bundle(actual, input)? else {
         return Ok(ImportOutcome::CredentialCaptureRequired);
+    };
+    repository.create_identity_bundle(&bundle)?;
+    Ok(ImportOutcome::Imported)
+}
+
+pub fn build_scanned_identity_bundle(
+    actual: &ActualCodexState,
+    input: ImportIdentityInput,
+) -> Result<Option<IdentityBundle>, ApplicationError> {
+    let Some(credential) = input.credential else {
+        return Ok(None);
     };
     if AuthMode::from(credential.kind()) != actual.authentication.auth_mode
         || credential.credential_fingerprint() != &actual.authentication.credential_fingerprint
@@ -246,13 +288,12 @@ pub fn import_scanned_identity<R: IdentityBundleRepository>(
         actual.config.baseline_sha256.clone(),
         input.now,
     );
-    repository.create_identity_bundle(&IdentityBundle {
+    Ok(Some(IdentityBundle {
         credential_to_create: (!input.credential_already_persisted).then_some(credential),
         identity,
         preset,
         patch,
-    })?;
-    Ok(ImportOutcome::Imported)
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,4 +356,50 @@ pub fn match_actual_identity<R: IdentityMatchRepository>(
         1 => MatchStatus::UniqueMatch(matches.remove(0)),
         _ => MatchStatus::MultipleMatches,
     })
+}
+
+#[cfg(test)]
+mod planned_config_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::{PlannedConfig, RedactedDiff};
+    use codex_domain::ContentHash;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn planned_config_debug_redacts_preserved_unknown_config_bytes() {
+        let canary = "UNKNOWN_CONFIG_CANARY_VALUE_7QZ9";
+        let plan = PlannedConfig {
+            target_bytes: Zeroizing::new(format!("unknown_field = \"{canary}\"\n").into_bytes()),
+            baseline_sha256: ContentHash::parse(&"a".repeat(64)).unwrap(),
+            target_sha256: ContentHash::parse(&"b".repeat(64)).unwrap(),
+            changes: Vec::new(),
+            diff: RedactedDiff::new(Vec::new()),
+        };
+
+        let debug = format!("{plan:?}");
+        assert!(!debug.contains(canary));
+        assert!(debug.contains("[REDACTED_BYTES]"));
+    }
+
+    #[test]
+    fn planned_config_keeps_target_bytes_zeroizing_through_unwind() {
+        fn require_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+
+        let canary = "UNCLASSIFIED_CONFIG_CANARY_4M8P";
+        let plan = PlannedConfig {
+            target_bytes: Zeroizing::new(canary.as_bytes().to_vec()),
+            baseline_sha256: ContentHash::parse(&"c".repeat(64)).unwrap(),
+            target_sha256: ContentHash::parse(&"d".repeat(64)).unwrap(),
+            changes: Vec::new(),
+            diff: RedactedDiff::new(Vec::new()),
+        };
+        require_zeroizing(&plan.target_bytes);
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            let _owned_until_unwind = plan;
+            panic!("synthetic planned config unwind");
+        }));
+        let payload = result.unwrap_err();
+        assert!(!format!("{payload:?}").contains(canary));
+    }
 }

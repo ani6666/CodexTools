@@ -11,6 +11,7 @@ codex-application = { path = "../codex-application" }
 codex-domain = { path = "../codex-domain" }
 codex-adapter = { path = "../codex-adapter" }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
+native-tls = { version = "=0.2.18", default-features = false }
 windows-platform = { path = "../windows-platform" }
 zeroize = "=1.8.2"
 

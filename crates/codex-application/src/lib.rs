@@ -10,12 +10,18 @@ use codex_domain::{
 
 pub mod codex;
 pub use codex::*;
+mod preset_binding;
+pub use preset_binding::*;
+mod capture_import;
+pub use capture_import::*;
 mod backup;
 pub use backup::*;
 mod credential_store;
 pub use credential_store::*;
 mod oauth;
 pub use oauth::*;
+mod model_discovery;
+pub use model_discovery::*;
 mod switch;
 pub use switch::*;
 

@@ -283,7 +283,7 @@ impl WindowsDpapiCredentialStore {
         path: &Path,
     ) -> Result<(), CredentialStoreError> {
         let bytes = secure_read_contained_file(&self.root, path, MAX_ENVELOPE_BYTES as u64)
-            .map_err(|_| CredentialStoreError::CorruptEnvelope)?;
+            .map_err(map_secure_read_error)?;
         let protected = decode_envelope(binding, &bytes)?;
         let entropy = binding_entropy(binding);
         self.protector.unprotect(&entropy, &protected, |plaintext| {
@@ -331,7 +331,7 @@ impl WindowsDpapiCredentialStore {
     ) -> Result<CredentialMaterialDiagnostic, CredentialStoreError> {
         self.validate_envelope_path(binding, path)?;
         let envelope = secure_read_contained_file(&self.root, path, MAX_ENVELOPE_BYTES as u64)
-            .map_err(|_| CredentialStoreError::CorruptEnvelope)?;
+            .map_err(map_secure_read_error)?;
         Ok(CredentialMaterialDiagnostic {
             material_ref: self
                 .material_path(binding)
@@ -509,7 +509,8 @@ impl CredentialStore for WindowsDpapiCredentialStore {
                 binding,
                 &quarantine.join(format!("generation-{}.dpapi", binding.generation().value())),
             ),
-            _ => Err(CredentialStoreError::RecoveryRequired),
+            (false, false) => Err(CredentialStoreError::NotFound),
+            (true, true) => Err(CredentialStoreError::RecoveryRequired),
         }
     }
 
@@ -588,6 +589,14 @@ impl CredentialStore for WindowsDpapiCredentialStore {
             return Err(CredentialStoreError::RecoveryRequired);
         }
         Ok(())
+    }
+}
+
+fn map_secure_read_error(error: std::io::Error) -> CredentialStoreError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => CredentialStoreError::NotFound,
+        std::io::ErrorKind::InvalidData => CredentialStoreError::CorruptEnvelope,
+        _ => CredentialStoreError::IoFailure,
     }
 }
 

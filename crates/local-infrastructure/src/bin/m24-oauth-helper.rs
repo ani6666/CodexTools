@@ -4,6 +4,7 @@ use codex_adapter as _;
 use codex_application as _;
 use codex_domain as _;
 use local_infrastructure as _;
+use native_tls as _;
 use rusqlite as _;
 use std::{env, fs, path::PathBuf, process::Command, thread, time::Duration};
 use zeroize as _;

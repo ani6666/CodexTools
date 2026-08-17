@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="CodexTools">
+  <rect width="512" height="512" rx="112" fill="#294d3d" />
+  <path
+    fill="#f8f5e9"
+    d="M154 132h204a42 42 0 0 1 42 42v48h-56v-34H168v136h176v-34h56v48a42 42 0 0 1-42 42H154a42 42 0 0 1-42-42V174a42 42 0 0 1 42-42Z"
+  />
+  <path fill="#d6a85f" d="M232 218h168v76H232z" />
+</svg>

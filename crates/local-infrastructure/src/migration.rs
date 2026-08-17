@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 10;
+pub const LATEST_SCHEMA_VERSION: u32 = 11;
 pub const MIGRATION_0001_SQL: &str = include_str!("../migrations/0001_identity_core.sql");
 pub const MIGRATION_0002_SQL: &str = include_str!("../migrations/0002_managed_config_patch.sql");
 pub const MIGRATION_0003_SQL: &str = include_str!("../migrations/0003_switch_transaction.sql");
@@ -16,6 +16,7 @@ pub const MIGRATION_0009_SQL: &str =
     include_str!("../migrations/0009_credential_recovery_planned_fingerprint.sql");
 pub const MIGRATION_0010_SQL: &str =
     include_str!("../migrations/0010_switch_sensitive_temp_owner.sql");
+pub const MIGRATION_0011_SQL: &str = include_str!("../migrations/0011_capture_import_recovery.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationError {
@@ -52,6 +53,7 @@ pub(crate) enum MigrationFailurePoint {
     AfterCredentialRecoveryTimestamps,
     AfterCredentialRecoveryPlannedFingerprint,
     AfterSensitiveTempOwnerSchema,
+    AfterCaptureImportRecovery,
 }
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
@@ -282,6 +284,26 @@ fn migrate_internal(
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at_unix_ms) VALUES (?1, ?2, ?3)",
                 (10_u32, "switch_sensitive_temp_owner", applied_at),
+            )
+            .map_err(|_| MigrationError::Failed)?;
+    }
+
+    if current < 11 {
+        transaction
+            .execute_batch(MIGRATION_0011_SQL)
+            .map_err(|_| MigrationError::Failed)?;
+        if failure_point == MigrationFailurePoint::AfterCaptureImportRecovery {
+            return Err(MigrationError::Failed);
+        }
+        let applied_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MigrationError::Failed)?
+            .as_millis();
+        let applied_at = i64::try_from(applied_at).map_err(|_| MigrationError::Failed)?;
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_unix_ms) VALUES (?1, ?2, ?3)",
+                (11_u32, "capture_import_recovery", applied_at),
             )
             .map_err(|_| MigrationError::Failed)?;
     }

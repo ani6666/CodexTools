@@ -1,20 +1,47 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use codex_application::{CompatibilityReason, LineEnding};
+use zeroize::Zeroizing;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Assignment {
-    pub value: String,
+    pub value: Zeroizing<String>,
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Clone, Debug)]
+impl fmt::Debug for Assignment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Assignment")
+            .field("value", &"[REDACTED_TOML_VALUE]")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct ParsedToml {
-    pub text: String,
+    pub text: Zeroizing<String>,
     pub has_bom: bool,
     pub line_ending: LineEnding,
     pub assignments: BTreeMap<String, Assignment>,
+}
+
+impl fmt::Debug for ParsedToml {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParsedToml")
+            .field("text", &"[REDACTED_TOML_TEXT]")
+            .field("has_bom", &self.has_bom)
+            .field("line_ending", &self.line_ending)
+            .field("assignments", &self.assignments)
+            .finish()
+    }
 }
 
 fn bare(value: &str) -> bool {
@@ -51,12 +78,12 @@ fn split_comment(line: &str) -> Result<(&str, usize), CompatibilityReason> {
     Ok((line, line.len()))
 }
 
-fn basic_string(value: &str) -> Result<String, CompatibilityReason> {
+fn basic_string(value: &str) -> Result<Zeroizing<String>, CompatibilityReason> {
     if !value.starts_with('"') || !value.ends_with('"') || value.len() < 2 {
         return Err(CompatibilityReason::UnsupportedTomlSubset);
     }
     let inner = &value[1..value.len() - 1];
-    let mut out = String::new();
+    let mut out = Zeroizing::new(String::new());
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch == '\\' {
@@ -82,7 +109,7 @@ fn basic_string(value: &str) -> Result<String, CompatibilityReason> {
     Ok(out)
 }
 
-fn validate_value(value: &str) -> Result<Option<String>, CompatibilityReason> {
+fn validate_value(value: &str) -> Result<Option<Zeroizing<String>>, CompatibilityReason> {
     if value.starts_with('"') {
         return basic_string(value).map(Some);
     }
@@ -101,9 +128,11 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedToml, CompatibilityReason> {
     } else {
         (false, bytes)
     };
-    let text = std::str::from_utf8(body)
-        .map_err(|_| CompatibilityReason::InvalidUtf8)?
-        .to_owned();
+    let text = Zeroizing::new(
+        std::str::from_utf8(body)
+            .map_err(|_| CompatibilityReason::InvalidUtf8)?
+            .to_owned(),
+    );
     if text
         .as_bytes()
         .windows(1)
@@ -204,7 +233,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedToml, CompatibilityReason> {
         assignments.insert(
             path,
             Assignment {
-                value: parsed.unwrap_or_else(|| value.to_owned()),
+                value: parsed.unwrap_or_else(|| Zeroizing::new(value.to_owned())),
                 start,
                 end,
             },
@@ -238,7 +267,7 @@ pub fn encode_string(value: &str) -> String {
 pub fn replace_strings(
     parsed: &ParsedToml,
     replacements: &[(String, String)],
-) -> Result<Vec<u8>, CompatibilityReason> {
+) -> Result<Zeroizing<Vec<u8>>, CompatibilityReason> {
     let mut ranges = Vec::new();
     for (path, value) in replacements {
         let a = parsed
@@ -255,10 +284,28 @@ pub fn replace_strings(
     for (start, end, value) in ranges {
         text.replace_range(start..end, &value)
     }
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     if parsed.has_bom {
         out.extend_from_slice(&[0xef, 0xbb, 0xbf])
     }
     out.extend_from_slice(text.as_bytes());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn parsed_toml_debug_redacts_owned_text_and_assignment_values() {
+        let canary = "CONFIG_CANARY_VALUE_XYZ789";
+        let text = format!("model = \"{canary}\"\n");
+        let parsed = parse(text.as_bytes()).unwrap();
+        let debug = format!("{parsed:?}");
+
+        assert!(!debug.contains(canary));
+        assert!(!debug.contains(&format!("{:?}", text)));
+        assert!(debug.contains("[REDACTED_TOML_TEXT]"));
+        assert!(debug.contains("[REDACTED_TOML_VALUE]"));
+    }
 }

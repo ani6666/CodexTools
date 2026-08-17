@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::migration::{
-    MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MigrationFailurePoint,
-    migrate_for_test,
+    LATEST_SCHEMA_VERSION, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL,
+    MigrationFailurePoint, migrate_for_test,
 };
 use rusqlite::{Connection, params};
 
@@ -146,7 +146,10 @@ fn v3_upgrade_adds_one_active_transaction_slot_per_root() {
     );
 
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     assert_eq!(
         schema_object_count(&connection, "ux_switch_transactions_active_root"),
         1
@@ -277,7 +280,10 @@ fn v4_upgrade_adds_versioned_backup_metadata_and_is_repeatable() {
 
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     assert_eq!(schema_object_count(&connection, "backup_sets"), 1);
     assert_eq!(
         schema_object_count(&connection, "ux_backup_sets_permanent_root"),
@@ -312,7 +318,10 @@ fn v5_upgrade_adds_recovery_journals_atomically_and_is_repeatable() {
     );
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     assert_eq!(
         schema_object_count(&connection, "backup_recovery_operations"),
         1
@@ -349,7 +358,10 @@ fn v7_upgrade_adds_credential_single_owner_guard_and_fails_closed_on_duplicates(
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
     demote_to_v6_recovery(&connection);
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     assert_eq!(
         schema_object_count(&connection, "ux_credential_recovery_active"),
         1
@@ -395,7 +407,9 @@ fn demote_to_v6_recovery(connection: &Connection) {
 fn demote_v10(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER switch_sensitive_temp_owner_blocks_terminal;
+            "DROP TABLE capture_import_operations;
+         DELETE FROM schema_migrations WHERE version=11;
+         DROP TRIGGER switch_sensitive_temp_owner_blocks_terminal;
          DROP TABLE switch_sensitive_temp_anomalies;
          DROP TABLE switch_sensitive_temp_owners;
          DELETE FROM schema_migrations WHERE version=10;",
@@ -462,7 +476,10 @@ fn v8_upgrade_binds_distinct_credential_timestamps_and_is_atomic() {
 
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     let timestamps = connection.query_row(
         "SELECT credential_created_at_unix_ms,credential_updated_at_unix_ms,created_at_unix_ms,updated_at_unix_ms FROM credential_recovery_operations WHERE operation_id='v8-rotate'",
         [],
@@ -528,7 +545,10 @@ fn v9_upgrade_binds_exact_rows_preserves_legacy_recovery_and_is_atomic() {
 
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     let exact = connection.query_row(
         "SELECT planned_credential_fingerprint,legacy_unbound FROM credential_recovery_operations WHERE operation_id='v9-exact'",
         [],
@@ -557,7 +577,10 @@ fn v10_switch_sensitive_temp_owner_schema_is_durable_and_atomic() {
     let mut connection = Connection::open_in_memory().unwrap();
     migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
 
-    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
     for table in [
         "switch_sensitive_temp_owners",
         "switch_sensitive_temp_anomalies",
@@ -574,10 +597,11 @@ fn v10_switch_sensitive_temp_owner_schema_is_durable_and_atomic() {
 
     let mut v9 = Connection::open_in_memory().unwrap();
     migrate_for_test(&mut v9, MigrationFailurePoint::None).unwrap();
-    v9.execute("DELETE FROM schema_migrations WHERE version=10", [])
-        .unwrap();
     v9.execute_batch(
-        "DROP TRIGGER switch_sensitive_temp_owner_blocks_terminal;
+        "DROP TABLE capture_import_operations;
+         DELETE FROM schema_migrations WHERE version=11;
+         DELETE FROM schema_migrations WHERE version=10;
+         DROP TRIGGER switch_sensitive_temp_owner_blocks_terminal;
          DROP TABLE switch_sensitive_temp_anomalies;
          DROP TABLE switch_sensitive_temp_owners;",
     )
@@ -600,7 +624,47 @@ fn v10_switch_sensitive_temp_owner_schema_is_durable_and_atomic() {
         0
     );
     migrate_for_test(&mut v9, MigrationFailurePoint::None).unwrap();
-    assert_eq!(schema_version(&v9), 10);
+    assert_eq!(schema_version(&v9), i64::from(LATEST_SCHEMA_VERSION));
+}
+
+#[test]
+fn v11_capture_import_recovery_schema_is_atomic_and_repeatable() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE capture_import_operations;
+             DELETE FROM schema_migrations WHERE version=11;",
+        )
+        .unwrap();
+
+    assert!(
+        migrate_for_test(
+            &mut connection,
+            MigrationFailurePoint::AfterCaptureImportRecovery,
+        )
+        .is_err()
+    );
+    assert_eq!(schema_version(&connection), 10);
+    assert_eq!(
+        schema_object_count(&connection, "capture_import_operations"),
+        0
+    );
+
+    migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
+    migrate_for_test(&mut connection, MigrationFailurePoint::None).unwrap();
+    assert_eq!(
+        schema_version(&connection),
+        i64::from(LATEST_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        schema_object_count(&connection, "capture_import_operations"),
+        1
+    );
+    assert_eq!(
+        schema_object_count(&connection, "idx_capture_import_unfinished"),
+        1
+    );
 }
 
 fn insert_switch_row(connection: &Connection, id: &str, state: &str) {

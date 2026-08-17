@@ -43,7 +43,7 @@ pub struct SwitchPlan {
     root: PathBuf,
     config_source: FileBaseline,
     auth_source: FileBaseline,
-    target_config: Vec<u8>,
+    target_config: Zeroizing<Vec<u8>>,
     target_auth: Zeroizing<Vec<u8>>,
     provider_id: ProviderId,
     model_id: ModelId,
@@ -86,12 +86,12 @@ impl SwitchPlan {
         created_at: UnixMillis,
         expires_at: UnixMillis,
     ) -> Result<Self, SwitchExecutionError> {
-        Self::new_zeroizing_auth(
+        Self::new_zeroizing(
             id,
             root,
             config_source,
             auth_source,
-            target_config,
+            Zeroizing::new(target_config),
             Zeroizing::new(target_auth),
             provider_id,
             model_id,
@@ -108,6 +108,35 @@ impl SwitchPlan {
         config_source: FileBaseline,
         auth_source: FileBaseline,
         target_config: Vec<u8>,
+        target_auth: Zeroizing<Vec<u8>>,
+        provider_id: ProviderId,
+        model_id: ModelId,
+        auth_fingerprint: CredentialFingerprint,
+        created_at: UnixMillis,
+        expires_at: UnixMillis,
+    ) -> Result<Self, SwitchExecutionError> {
+        Self::new_zeroizing(
+            id,
+            root,
+            config_source,
+            auth_source,
+            Zeroizing::new(target_config),
+            target_auth,
+            provider_id,
+            model_id,
+            auth_fingerprint,
+            created_at,
+            expires_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_zeroizing(
+        id: SwitchTransactionId,
+        root: PathBuf,
+        config_source: FileBaseline,
+        auth_source: FileBaseline,
+        target_config: Zeroizing<Vec<u8>>,
         target_auth: Zeroizing<Vec<u8>>,
         provider_id: ProviderId,
         model_id: ModelId,

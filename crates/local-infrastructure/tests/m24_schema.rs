@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use local_infrastructure::SqliteMetadataRepository;
+use local_infrastructure::{LATEST_SCHEMA_VERSION, SqliteMetadataRepository};
 use rusqlite::{Connection, params};
 
 #[test]
@@ -29,7 +29,7 @@ fn schema_v10_is_auditable_and_enforces_recovery_ownership_dynamically() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, i64::from(LATEST_SCHEMA_VERSION));
     for table in [
         "switch_sensitive_temp_owners",
         "switch_sensitive_temp_anomalies",
@@ -128,6 +128,7 @@ fn schema_v10_is_auditable_and_enforces_recovery_ownership_dynamically() {
     for table in [
         "backup_recovery_operations",
         "credential_recovery_operations",
+        "capture_import_operations",
     ] {
         let count: i64 = connection
             .query_row(
@@ -269,7 +270,7 @@ fn schema_v10_is_auditable_and_enforces_recovery_ownership_dynamically() {
     remove_sqlite_files(&path);
     assert!(!path.exists());
     println!(
-        "M24_SCHEMA version=10 backup_columns=9 recovery_journals=2 sensitive_temp_owner=durable_full owner_identity=volume_fileid128 owner_lifecycle=guarded readonly_guard=durable anomalies=fail_closed credential_timestamps=distinct_and_checked planned_fingerprint=required_and_immutable legacy_unbound=read_only secret_columns=0 permanent_unique=enforced recovery_root_unique=enforced credential_single_owner=enforced backup_validated_phase=enforced credential_prepared_guard=enforced relative_path=enforced transaction_fk=enforced cleanup=true"
+        "M24_SCHEMA version=11 schema_v10_invariants=preserved backup_columns=9 recovery_journals=3 sensitive_temp_owner=durable_full owner_identity=volume_fileid128 owner_lifecycle=guarded readonly_guard=durable anomalies=fail_closed credential_timestamps=distinct_and_checked planned_fingerprint=required_and_immutable legacy_unbound=read_only secret_columns=0 permanent_unique=enforced recovery_root_unique=enforced credential_single_owner=enforced backup_validated_phase=enforced credential_prepared_guard=enforced relative_path=enforced transaction_fk=enforced cleanup=true"
     );
 }
 

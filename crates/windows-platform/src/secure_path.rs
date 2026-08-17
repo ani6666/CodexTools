@@ -1,5 +1,38 @@
 use std::{io, path::Path};
 
+#[cfg(windows)]
+pub fn default_codex_root() -> io::Result<std::path::PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath},
+    };
+
+    let mut raw = std::ptr::null_mut();
+    let result =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, 0, std::ptr::null_mut(), &mut raw) };
+    if result < 0 || raw.is_null() {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let mut length = 0_usize;
+    unsafe {
+        while *raw.add(length) != 0 {
+            length += 1;
+        }
+    }
+    let profile = OsString::from_wide(unsafe { std::slice::from_raw_parts(raw, length) });
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Ok(std::path::PathBuf::from(profile).join(".codex"))
+}
+
+#[cfg(not(windows))]
+pub fn default_codex_root() -> io::Result<std::path::PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows known-folder lookup is required",
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SecureFileIdentity {
     pub volume_serial_number: u32,

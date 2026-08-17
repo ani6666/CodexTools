@@ -33,6 +33,26 @@ impl ModelPreset {
         }
     }
 
+    /// 构造可由身份管理界面编辑的安全预设元数据。
+    pub fn new_managed(
+        id: ModelPresetId,
+        identity_id: IdentityId,
+        name: EntityName,
+        model_id: ModelId,
+        created_at: UnixMillis,
+    ) -> Result<Self, DomainError> {
+        Self::validate_managed_metadata(&name, &model_id)?;
+        Ok(Self::new(id, identity_id, name, model_id, created_at))
+    }
+
+    pub fn validate_managed_metadata(
+        name: &EntityName,
+        model_id: &ModelId,
+    ) -> Result<(), DomainError> {
+        name.ensure_preset_metadata_safe()?;
+        model_id.ensure_preset_metadata_safe()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: ModelPresetId,
@@ -63,6 +83,26 @@ impl ModelPreset {
         }
         Ok(Self {
             name,
+            updated_at,
+            version: self.version.next()?,
+            ..self.clone()
+        })
+    }
+
+    /// 同时更新 M2.7 允许编辑的非敏感字段，并保持归属与创建时间不变。
+    pub fn update_metadata(
+        &self,
+        name: EntityName,
+        model_id: ModelId,
+        updated_at: UnixMillis,
+    ) -> Result<Self, DomainError> {
+        Self::validate_managed_metadata(&name, &model_id)?;
+        if updated_at < self.updated_at {
+            return Err(DomainError::TimestampOrder);
+        }
+        Ok(Self {
+            name,
+            model_id,
             updated_at,
             version: self.version.next()?,
             ..self.clone()

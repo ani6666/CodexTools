@@ -1,7 +1,12 @@
 use crate::DomainError;
 
 fn contains_secret_like(value: &str) -> bool {
-    let bytes = value.as_bytes();
+    contains_high_confidence_secret_bytes(value.as_bytes())
+}
+
+/// 字节级高置信检测，供需要检查原始配置缓冲区的 M2/M3 边界复用。
+#[must_use]
+pub fn contains_high_confidence_secret_bytes(bytes: &[u8]) -> bool {
     let looks_like_openai = contains_prefixed_run(bytes, b"sk-", 20, |byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
     });
@@ -15,14 +20,32 @@ fn contains_secret_like(value: &str) -> bool {
         byte.is_ascii_uppercase() || byte.is_ascii_digit()
     });
     let looks_like_jwt = contains_jwt(bytes);
-    let looks_like_private_key = ["PRIVATE KEY", "RSA PRIVATE KEY", "OPENSSH PRIVATE KEY"]
-        .iter()
-        .any(|label| value.contains(&format!("-----BEGIN {label}-----")));
+    let looks_like_private_key = [
+        "PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+    ]
+    .iter()
+    .any(|label| {
+        let header = format!("-----BEGIN {label}-----");
+        bytes
+            .windows(header.len())
+            .any(|window| window == header.as_bytes())
+    });
     looks_like_openai
         || looks_like_github
         || looks_like_aws
         || looks_like_jwt
         || looks_like_private_key
+}
+
+/// 判断输入是否匹配高置信秘密形态，供跨 crate 边界复用同一规则。
+///
+/// 该函数只返回布尔结果，不保留或回显输入正文。
+pub fn contains_high_confidence_secret(value: &str) -> bool {
+    contains_secret_like(value)
 }
 
 fn contains_prefixed_run(
@@ -143,6 +166,13 @@ impl EntityName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn ensure_preset_metadata_safe(&self) -> Result<(), DomainError> {
+        if self.0.contains(['/', '\\']) || looks_like_rooted_path(&self.0) {
+            return Err(DomainError::InvalidFormat);
+        }
+        Ok(())
+    }
 }
 
 /// Codex Provider 标识。
@@ -186,6 +216,30 @@ impl ModelId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn ensure_preset_metadata_safe(&self) -> Result<(), DomainError> {
+        let value = self.0.as_str();
+        if looks_like_rooted_path(value)
+            || value.starts_with("~/")
+            || value.ends_with('/')
+            || value.contains("//")
+            || value
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+        {
+            return Err(DomainError::InvalidFormat);
+        }
+        Ok(())
+    }
+}
+
+fn looks_like_rooted_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '\\'])
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 /// 不包含查询、片段或用户信息的 HTTP(S) 端点。

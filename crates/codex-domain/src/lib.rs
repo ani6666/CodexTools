@@ -5,6 +5,7 @@ mod credential;
 mod error;
 mod identity;
 mod managed_patch;
+mod network;
 mod preset;
 mod switch;
 mod value;
@@ -15,12 +16,16 @@ pub use credential::{
 pub use error::DomainError;
 pub use identity::{IdentityStatus, RuntimeIdentity};
 pub use managed_patch::{MANAGED_CONFIG_PATHS, ManagedConfigPatch};
+pub use network::{
+    DiscoveredModel, EndpointPolicy, NETWORK_POLICY_VERSION, NetworkPolicyError, NormalizedEndpoint,
+};
 pub use preset::ModelPreset;
 pub use switch::{FileRole, SwitchTransaction, SwitchTransactionState};
 pub use value::{
     ContentHash, CredentialFingerprint, CredentialRefId, EndpointUrl, EntityName, EntityVersion,
     IdentityId, ManagedConfigPatchId, ModelId, ModelPresetId, ProviderId, SchemaFingerprint,
-    SwitchTransactionId, UnixMillis,
+    SwitchTransactionId, UnixMillis, contains_high_confidence_secret,
+    contains_high_confidence_secret_bytes,
 };
 
 /// 当前核心实现所达到的里程碑阶段。

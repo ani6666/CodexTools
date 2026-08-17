@@ -161,7 +161,8 @@ fn migration_is_versioned_repeatable_and_enables_foreign_keys() {
             (7, "m24_r3_recovery_guards".to_owned()),
             (8, "credential_recovery_timestamps".to_owned()),
             (9, "credential_recovery_planned_fingerprint".to_owned()),
-            (10, "switch_sensitive_temp_owner".to_owned())
+            (10, "switch_sensitive_temp_owner".to_owned()),
+            (11, "capture_import_recovery".to_owned())
         ]
     );
     let migration_count: i64 = connection
@@ -169,7 +170,7 @@ fn migration_is_versioned_repeatable_and_enables_foreign_keys() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration_count, 10);
+    assert_eq!(migration_count, i64::from(LATEST_SCHEMA_VERSION));
 }
 
 #[test]

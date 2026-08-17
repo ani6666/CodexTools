@@ -6,9 +6,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
-
 use codex_adapter::{CodexAdapter, hash_bytes};
 use codex_application::{
     Clock, CompatibilityReason, EntityKind, FileBaseline, RepositoryError, ScanStatus,
@@ -187,6 +184,7 @@ impl StabilityWindow for ThreadStabilityWindow {
 
 pub struct CrossProcessWriteLock {
     file: Option<File>,
+    root: Option<RootNamespacePin>,
     owner: LockOwnerInfo,
 }
 
@@ -203,8 +201,27 @@ impl std::fmt::Debug for CrossProcessWriteLock {
 impl CrossProcessWriteLock {
     #[must_use]
     pub fn read_diagnostic(root: &Path) -> LockDiagnostic {
-        let Ok(text) = fs::read_to_string(root.join(".codextools-write.lock")) else {
-            return LockDiagnostic::Missing;
+        let root = match pin_write_lock_root(root) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return LockDiagnostic::Missing;
+            }
+            Err(_) => return LockDiagnostic::Corrupt,
+        };
+        let mut file = match PinnedLiveFile::open_lock_diagnostic(&root, ".codextools-write.lock") {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return LockDiagnostic::Missing;
+            }
+            Err(_) => return LockDiagnostic::Corrupt,
+        };
+        let bytes = match file.reread(4096) {
+            Ok(value) => value,
+            Err(_) => return LockDiagnostic::Corrupt,
+        };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(value) => value,
+            Err(_) => return LockDiagnostic::Corrupt,
         };
         let mut process_id = None;
         let mut acquired_at = None;
@@ -228,15 +245,10 @@ impl CrossProcessWriteLock {
         }
     }
     pub fn try_acquire(root: &Path, now: UnixMillis) -> Result<Self, SwitchExecutionError> {
-        if !root.is_absolute() || !root.is_dir() {
+        if !root.is_absolute() {
             return Err(SwitchExecutionError::IoFailure);
         }
-        let path = root.join(".codextools-write.lock");
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(true);
-        #[cfg(windows)]
-        options.share_mode(1);
-        let mut file = options.open(&path).map_err(|error| {
+        let root = pin_write_lock_root(root).map_err(|error| {
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
@@ -247,6 +259,26 @@ impl CrossProcessWriteLock {
                 SwitchExecutionError::IoFailure
             }
         })?;
+        Self::try_acquire_pinned(root, now)
+    }
+
+    pub(crate) fn try_acquire_pinned(
+        root: RootNamespacePin,
+        now: UnixMillis,
+    ) -> Result<Self, SwitchExecutionError> {
+        let mut file = root
+            .open_write_lock(".codextools-write.lock")
+            .map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                ) || matches!(error.raw_os_error(), Some(32 | 33))
+                {
+                    SwitchExecutionError::Busy
+                } else {
+                    SwitchExecutionError::IoFailure
+                }
+            })?;
         let owner = LockOwnerInfo {
             process_id: std::process::id(),
             acquired_at: now,
@@ -262,8 +294,12 @@ impl CrossProcessWriteLock {
             .map_err(|_| SwitchExecutionError::IoFailure)?;
         Ok(Self {
             file: Some(file),
+            root: Some(root),
             owner,
         })
+    }
+    pub(crate) fn root_pin(&self) -> Result<&RootNamespacePin, SwitchExecutionError> {
+        self.root.as_ref().ok_or(SwitchExecutionError::IoFailure)
     }
     pub const fn owner(&self) -> LockOwnerInfo {
         self.owner
@@ -272,8 +308,23 @@ impl CrossProcessWriteLock {
         if let Some(file) = self.file.take() {
             drop(file);
         }
+        if let Some(root) = self.root.take() {
+            drop(root);
+        }
         Ok(())
     }
+}
+
+fn pin_write_lock_root(root: &Path) -> io::Result<RootNamespacePin> {
+    #[cfg(windows)]
+    if matches!(
+        root.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+    ) {
+        return RootNamespacePin::acquire_canonical(root);
+    }
+    RootNamespacePin::acquire(root)
 }
 impl Drop for CrossProcessWriteLock {
     fn drop(&mut self) {
